@@ -1182,7 +1182,8 @@ retry_duration:
     if (st->codecpar->codec_id == AV_CODEC_ID_AAC ||
         st->codecpar->codec_id == AV_CODEC_ID_H264 ||
         st->codecpar->codec_id == AV_CODEC_ID_MPEG4 ||
-        st->codecpar->codec_id == AV_CODEC_ID_HEVC) {
+        st->codecpar->codec_id == AV_CODEC_ID_HEVC||
+            st->codecpar->codec_id == AV_CODEC_ID_OPUS) {
         int type = avio_r8(s->pb);
         size--;
 
@@ -1208,7 +1209,8 @@ retry_duration:
             }
         }
         if (type == 0 && (!st->codecpar->extradata || st->codecpar->codec_id == AV_CODEC_ID_AAC ||
-            st->codecpar->codec_id == AV_CODEC_ID_H264 || st->codecpar->codec_id == AV_CODEC_ID_HEVC)) {
+            st->codecpar->codec_id == AV_CODEC_ID_H264 || st->codecpar->codec_id == AV_CODEC_ID_HEVC ||
+            st->codecpar->codec_id == AV_CODEC_ID_OPUS)) {
             AVDictionaryEntry *t;
 
             if (st->codecpar->extradata) {
@@ -1224,7 +1226,7 @@ retry_duration:
             t = av_dict_get(s->metadata, "Encoder", NULL, 0);
             if (st->codecpar->codec_id == AV_CODEC_ID_AAC && t && !strcmp(t->value, "Omnia A/XE"))
                 st->codecpar->extradata_size = 2;
-
+            
             if (st->codecpar->codec_id == AV_CODEC_ID_AAC && 0) {
                 MPEG4AudioConfig cfg;
 

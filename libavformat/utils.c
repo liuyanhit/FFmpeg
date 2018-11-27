@@ -1590,9 +1590,9 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
 
         /* read next packet */
         ret = ff_read_packet(s, &cur_pkt);
-        av_log(s, AV_LOG_WARNING,"ret return value %d cur_pkt.stream_index %d pts=%s, dts=%s\n",ret,cur_pkt.stream_index,
-               av_ts2str(cur_pkt.pts),
-               av_ts2str(cur_pkt.dts));
+//        av_log(s, AV_LOG_WARNING,"ret return value %d cur_pkt.stream_index %d pts=%s, dts=%s\n",ret,cur_pkt.stream_index,
+//               av_ts2str(cur_pkt.pts),
+//               av_ts2str(cur_pkt.dts));
 
         if (ret < 0) {
             if (ret == AVERROR(EAGAIN))
@@ -1786,7 +1786,7 @@ int av_read_frame(AVFormatContext *s, AVPacket *pkt)
     int ret;
     AVStream *st;
 
-    av_log(s,AV_LOG_WARNING," gents %d \n",genpts);
+    //av_log(s,AV_LOG_WARNING," gents %d \n",genpts);
     if (!genpts) {
 		/*this bufffer is only needed  when packets were already buffered but not decoded ，for example to get the codec parameters in mpeg streams
 		一般情况下 调用的是 read_frame_internal 直接返回

@@ -498,9 +498,9 @@ static void flv_write_codec_header(AVFormatContext* s, AVCodecParameters* par, i
     int64_t data_size;
     AVIOContext *pb = s->pb;
     FLVContext *flv = s->priv_data;
-
     if (par->codec_id == AV_CODEC_ID_AAC || par->codec_id == AV_CODEC_ID_H264 ||
-        par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC) {
+        par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC ||
+        par->codec_id == AV_CODEC_ID_OPUS) {
         int64_t pos;
         avio_w8(pb,
                 par->codec_type == AVMEDIA_TYPE_VIDEO ?
@@ -542,7 +542,11 @@ static void flv_write_codec_header(AVFormatContext* s, AVCodecParameters* par, i
                         data[0], data[1]);
             }
             avio_write(pb, par->extradata, par->extradata_size);
-        } else {
+        } else if (par->codec_id == AV_CODEC_ID_OPUS){
+            avio_w8(pb, get_audio_flags(s, par));
+            avio_w8(pb, 0); // Opus sequence header
+            avio_write(pb, par->extradata, par->extradata_size);
+        }else {
             avio_w8(pb, par->codec_tag | FLV_FRAME_KEY); // flags
             avio_w8(pb, 0); // AVC sequence header
             avio_wb24(pb, 0); // composition time
@@ -902,8 +906,8 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     if (par->codec_id == AV_CODEC_ID_VP6F || par->codec_id == AV_CODEC_ID_VP6A ||
-        par->codec_id == AV_CODEC_ID_VP6  || par->codec_id == AV_CODEC_ID_AAC)
-        flags_size = 2;
+        par->codec_id == AV_CODEC_ID_VP6  || par->codec_id == AV_CODEC_ID_AAC || par->codec_id == AV_CODEC_ID_OPUS)
+        flags_size = 2; //AV_CODEC_ID_OPUS 借鉴aac的思想，0 是opus的额外信息，1 是opus raw data
     else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC)
         flags_size = 5;
     else
@@ -925,7 +929,6 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
             flv_write_codec_header(s, par, pkt->dts);
         }
     }
-
     if (flv->delay == AV_NOPTS_VALUE)
         flv->delay = -pkt->dts;
 
@@ -1046,7 +1049,7 @@ static int flv_write_packet(AVFormatContext *s, AVPacket *pkt)
             else
                 avio_w8(pb, ((FFALIGN(par->width,  16) - par->width) << 4) |
                              (FFALIGN(par->height, 16) - par->height));
-        } else if (par->codec_id == AV_CODEC_ID_AAC)
+        } else if (par->codec_id == AV_CODEC_ID_AAC || par->codec_id == AV_CODEC_ID_OPUS)
             avio_w8(pb, 1); // AAC raw
         else if (par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_MPEG4 || par->codec_id == AV_CODEC_ID_HEVC) {
             avio_w8(pb, 1); // AVC NALU
