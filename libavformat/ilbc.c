@@ -49,7 +49,6 @@ static int ilbc_write_header(AVFormatContext *s)
         av_log(s, AV_LOG_ERROR, "Unsupported mode\n");
         return AVERROR(EINVAL);
     }
-    avio_flush(pb);
     return 0;
 }
 
@@ -59,7 +58,7 @@ static int ilbc_write_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-static int ilbc_probe(AVProbeData *p)
+static int ilbc_probe(const AVProbeData *p)
 {
     // Only check for "#!iLBC" which matches both formats
     if (!memcmp(p->buf, mode20_header, 6))

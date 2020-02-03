@@ -39,7 +39,7 @@ typedef struct FITSContext {
     int64_t pts;
 } FITSContext;
 
-static int fits_probe(AVProbeData *p)
+static int fits_probe(const AVProbeData *p)
 {
     const uint8_t *b = p->buf;
     if (!memcmp(b, "SIMPLE  =                    T", 30))
@@ -157,11 +157,11 @@ static int fits_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     av_bprint_init(&avbuf, FITS_BLOCK_SIZE, AV_BPRINT_SIZE_UNLIMITED);
     while ((ret = is_image(s, fits, &header, &avbuf, &size)) == 0) {
+        av_bprint_finalize(&avbuf, NULL);
         pos = avio_skip(s->pb, size);
         if (pos < 0)
             return pos;
 
-        av_bprint_finalize(&avbuf, NULL);
         av_bprint_init(&avbuf, FITS_BLOCK_SIZE, AV_BPRINT_SIZE_UNLIMITED);
         avpriv_fits_header_init(&header, STATE_XTENSION);
     }
