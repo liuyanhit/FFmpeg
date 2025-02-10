@@ -24,27 +24,25 @@
 #include "libavutil/opt.h"
 
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 
 typedef struct HWUploadContext {
     const AVClass *class;
 
     AVBufferRef       *hwdevice_ref;
-    AVHWDeviceContext *hwdevice;
 
     AVBufferRef       *hwframes_ref;
     AVHWFramesContext *hwframes;
+
+    char *device_type;
 } HWUploadContext;
 
-static int hwupload_query_formats(AVFilterContext *avctx)
+static int hwupload_init(AVFilterContext *avctx)
 {
     HWUploadContext *ctx = avctx->priv;
-    AVHWFramesConstraints *constraints = NULL;
-    const enum AVPixelFormat *input_pix_fmts, *output_pix_fmts;
-    AVFilterFormats *input_formats = NULL;
-    int err, i;
+    int err;
 
     if (!avctx->hw_device_ctx) {
         av_log(ctx, AV_LOG_ERROR, "A hardware device reference is required "
@@ -52,10 +50,31 @@ static int hwupload_query_formats(AVFilterContext *avctx)
         return AVERROR(EINVAL);
     }
 
-    ctx->hwdevice_ref = av_buffer_ref(avctx->hw_device_ctx);
-    if (!ctx->hwdevice_ref)
-        return AVERROR(ENOMEM);
-    ctx->hwdevice = (AVHWDeviceContext*)ctx->hwdevice_ref->data;
+    if (ctx->device_type) {
+        err = av_hwdevice_ctx_create_derived(
+            &ctx->hwdevice_ref,
+            av_hwdevice_find_type_by_name(ctx->device_type),
+            avctx->hw_device_ctx, 0);
+        if (err < 0)
+            return err;
+    } else {
+        ctx->hwdevice_ref = av_buffer_ref(avctx->hw_device_ctx);
+        if (!ctx->hwdevice_ref)
+            return AVERROR(ENOMEM);
+    }
+
+    return 0;
+}
+
+static int hwupload_query_formats(const AVFilterContext *avctx,
+                                  AVFilterFormatsConfig **cfg_in,
+                                  AVFilterFormatsConfig **cfg_out)
+{
+    const HWUploadContext *ctx = avctx->priv;
+    AVHWFramesConstraints *constraints = NULL;
+    const enum AVPixelFormat *input_pix_fmts, *output_pix_fmts;
+    AVFilterFormats *input_formats = NULL;
+    int err, i;
 
     constraints = av_hwdevice_get_hwframe_constraints(ctx->hwdevice_ref, NULL);
     if (!constraints) {
@@ -79,24 +98,25 @@ static int hwupload_query_formats(AVFilterContext *avctx)
         }
     }
 
-    if ((err = ff_formats_ref(input_formats, &avctx->inputs[0]->out_formats)) < 0 ||
+    if ((err = ff_formats_ref(input_formats, &cfg_in[0]->formats)) < 0 ||
         (err = ff_formats_ref(ff_make_format_list(output_pix_fmts),
-                              &avctx->outputs[0]->in_formats)) < 0)
+                              &cfg_out[0]->formats)) < 0)
         goto fail;
 
     av_hwframe_constraints_free(&constraints);
     return 0;
 
 fail:
-    av_buffer_unref(&ctx->hwdevice_ref);
     av_hwframe_constraints_free(&constraints);
     return err;
 }
 
 static int hwupload_config_output(AVFilterLink *outlink)
 {
+    FilterLink       *outl = ff_filter_link(outlink);
     AVFilterContext *avctx = outlink->src;
     AVFilterLink   *inlink = avctx->inputs[0];
+    FilterLink        *inl = ff_filter_link(inlink);
     HWUploadContext   *ctx = avctx->priv;
     int err;
 
@@ -105,13 +125,13 @@ static int hwupload_config_output(AVFilterLink *outlink)
     if (inlink->format == outlink->format) {
         // The input is already a hardware format, so we just want to
         // pass through the input frames in their own hardware context.
-        if (!inlink->hw_frames_ctx) {
+        if (!inl->hw_frames_ctx) {
             av_log(ctx, AV_LOG_ERROR, "No input hwframe context.\n");
             return AVERROR(EINVAL);
         }
 
-        outlink->hw_frames_ctx = av_buffer_ref(inlink->hw_frames_ctx);
-        if (!outlink->hw_frames_ctx)
+        outl->hw_frames_ctx = av_buffer_ref(inl->hw_frames_ctx);
+        if (!outl->hw_frames_ctx)
             return AVERROR(ENOMEM);
 
         return 0;
@@ -127,7 +147,13 @@ static int hwupload_config_output(AVFilterLink *outlink)
            av_get_pix_fmt_name(inlink->format));
 
     ctx->hwframes->format    = outlink->format;
-    ctx->hwframes->sw_format = inlink->format;
+    if (inl->hw_frames_ctx) {
+        AVHWFramesContext *in_hwframe_ctx =
+            (AVHWFramesContext*)inl->hw_frames_ctx->data;
+        ctx->hwframes->sw_format = in_hwframe_ctx->sw_format;
+    } else {
+        ctx->hwframes->sw_format = inlink->format;
+    }
     ctx->hwframes->width     = inlink->w;
     ctx->hwframes->height    = inlink->h;
 
@@ -138,8 +164,8 @@ static int hwupload_config_output(AVFilterLink *outlink)
     if (err < 0)
         goto fail;
 
-    outlink->hw_frames_ctx = av_buffer_ref(ctx->hwframes_ref);
-    if (!outlink->hw_frames_ctx) {
+    outl->hw_frames_ctx = av_buffer_ref(ctx->hwframes_ref);
+    if (!outl->hw_frames_ctx) {
         err = AVERROR(ENOMEM);
         goto fail;
     }
@@ -200,12 +226,20 @@ static av_cold void hwupload_uninit(AVFilterContext *avctx)
     av_buffer_unref(&ctx->hwdevice_ref);
 }
 
-static const AVClass hwupload_class = {
-    .class_name = "hwupload",
-    .item_name  = av_default_item_name,
-    .option     = NULL,
-    .version    = LIBAVUTIL_VERSION_INT,
+#define OFFSET(x) offsetof(HWUploadContext, x)
+#define FLAGS (AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM)
+static const AVOption hwupload_options[] = {
+    {
+        "derive_device", "Derive a new device of this type",
+        OFFSET(device_type), AV_OPT_TYPE_STRING,
+        { .str = NULL }, 0, 0, FLAGS
+    },
+    {
+        NULL
+    }
 };
+
+AVFILTER_DEFINE_CLASS(hwupload);
 
 static const AVFilterPad hwupload_inputs[] = {
     {
@@ -213,7 +247,6 @@ static const AVFilterPad hwupload_inputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .filter_frame = hwupload_filter_frame,
     },
-    { NULL }
 };
 
 static const AVFilterPad hwupload_outputs[] = {
@@ -222,17 +255,18 @@ static const AVFilterPad hwupload_outputs[] = {
         .type         = AVMEDIA_TYPE_VIDEO,
         .config_props = hwupload_config_output,
     },
-    { NULL }
 };
 
-AVFilter ff_vf_hwupload = {
-    .name          = "hwupload",
-    .description   = NULL_IF_CONFIG_SMALL("Upload a normal frame to a hardware frame"),
+const FFFilter ff_vf_hwupload = {
+    .p.name        = "hwupload",
+    .p.description = NULL_IF_CONFIG_SMALL("Upload a normal frame to a hardware frame"),
+    .p.priv_class  = &hwupload_class,
+    .p.flags       = AVFILTER_FLAG_HWDEVICE,
+    .init          = hwupload_init,
     .uninit        = hwupload_uninit,
-    .query_formats = hwupload_query_formats,
     .priv_size     = sizeof(HWUploadContext),
-    .priv_class    = &hwupload_class,
-    .inputs        = hwupload_inputs,
-    .outputs       = hwupload_outputs,
+    FILTER_INPUTS(hwupload_inputs),
+    FILTER_OUTPUTS(hwupload_outputs),
+    FILTER_QUERY_FUNC2(hwupload_query_formats),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

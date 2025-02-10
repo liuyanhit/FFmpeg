@@ -114,12 +114,10 @@ AVRational av_d2q(double d, int max)
         return (AVRational) { d < 0 ? -1 : 1, 0 };
     frexp(d, &exponent);
     exponent = FFMAX(exponent-1, 0);
-    den = 1LL << (61 - exponent);
+    den = 1LL << (62 - exponent);
     // (int64_t)rint() and llrint() do not work with gcc on ia64 and sparc64,
     // see Ticket2713 for affected gcc/glibc versions
     av_reduce(&a.num, &a.den, floor(d * den + 0.5), den, max);
-    if ((!a.num || !a.den) && d && max>0 && max<INT_MAX)
-        av_reduce(&a.num, &a.den, floor(d * den + 0.5), den, INT_MAX);
 
     return a;
 }
@@ -181,4 +179,13 @@ uint32_t av_q2intfloat(AVRational q) {
     av_assert1(n >= (1<<23));
 
     return sign<<31 | (150-shift)<<23 | (n - (1<<23));
+}
+
+AVRational av_gcd_q(AVRational a, AVRational b, int max_den, AVRational def)
+{
+    int64_t gcd, lcm;
+
+    gcd = av_gcd(a.den, b.den);
+    lcm = (a.den / gcd) * b.den;
+    return lcm < max_den ? av_make_q(av_gcd(a.num, b.num), lcm) : def;
 }

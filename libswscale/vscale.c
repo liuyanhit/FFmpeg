@@ -17,6 +17,7 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
+#include "libavutil/mem.h"
 #include "swscale_internal.h"
 
 typedef struct VScalerContext
@@ -25,12 +26,19 @@ typedef struct VScalerContext
     int32_t  *filter_pos;
     int filter_size;
     int isMMX;
-    void *pfn;
+    union {
+        yuv2planar1_fn      yuv2planar1;
+        yuv2planarX_fn      yuv2planarX;
+        yuv2interleavedX_fn yuv2interleavedX;
+        yuv2packed1_fn      yuv2packed1;
+        yuv2packed2_fn      yuv2packed2;
+        yuv2anyX_fn         yuv2anyX;
+    } pfn;
     yuv2packedX_fn yuv2packedX;
 } VScalerContext;
 
 
-static int lum_planar_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int lum_planar_vscale(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     VScalerContext *inst = desc->instance;
     int dstW = desc->dst->width;
@@ -43,9 +51,9 @@ static int lum_planar_vscale(SwsContext *c, SwsFilterDescriptor *desc, int slice
     uint16_t *filter = inst->filter[0] + (inst->isMMX ? 0 : sliceY * inst->filter_size);
 
     if (inst->filter_size == 1)
-        ((yuv2planar1_fn)inst->pfn)((const int16_t*)src[0], dst[0], dstW, c->lumDither8, 0);
+        inst->pfn.yuv2planar1((const int16_t*)src[0], dst[0], dstW, c->lumDither8, 0);
     else
-        ((yuv2planarX_fn)inst->pfn)(filter, inst->filter_size, (const int16_t**)src, dst[0], dstW, c->lumDither8, 0);
+        inst->pfn.yuv2planarX(filter, inst->filter_size, (const int16_t**)src, dst[0], dstW, c->lumDither8, 0);
 
     if (desc->alpha) {
         int sp = first - desc->src->plane[3].sliceY;
@@ -55,15 +63,15 @@ static int lum_planar_vscale(SwsContext *c, SwsFilterDescriptor *desc, int slice
         uint16_t *filter = inst->filter[1] + (inst->isMMX ? 0 : sliceY * inst->filter_size);
 
         if (inst->filter_size == 1)
-            ((yuv2planar1_fn)inst->pfn)((const int16_t*)src[0], dst[0], dstW, c->lumDither8, 0);
+            inst->pfn.yuv2planar1((const int16_t*)src[0], dst[0], dstW, c->lumDither8, 0);
         else
-            ((yuv2planarX_fn)inst->pfn)(filter, inst->filter_size, (const int16_t**)src, dst[0], dstW, c->lumDither8, 0);
+            inst->pfn.yuv2planarX(filter, inst->filter_size, (const int16_t**)src, dst[0], dstW, c->lumDither8, 0);
     }
 
     return 1;
 }
 
-static int chr_planar_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int chr_planar_vscale(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     const int chrSkipMask = (1 << desc->dst->v_chr_sub_sample) - 1;
     if (sliceY & chrSkipMask)
@@ -85,20 +93,20 @@ static int chr_planar_vscale(SwsContext *c, SwsFilterDescriptor *desc, int slice
         uint16_t *filter = inst->filter[0] + (inst->isMMX ? 0 : chrSliceY * inst->filter_size);
 
         if (c->yuv2nv12cX) {
-            ((yuv2interleavedX_fn)inst->pfn)(c, filter, inst->filter_size, (const int16_t**)src1, (const int16_t**)src2, dst1[0], dstW);
+            inst->pfn.yuv2interleavedX(c->opts.dst_format, c->chrDither8, filter, inst->filter_size, (const int16_t**)src1, (const int16_t**)src2, dst1[0], dstW);
         } else if (inst->filter_size == 1) {
-            ((yuv2planar1_fn)inst->pfn)((const int16_t*)src1[0], dst1[0], dstW, c->chrDither8, 0);
-            ((yuv2planar1_fn)inst->pfn)((const int16_t*)src2[0], dst2[0], dstW, c->chrDither8, 3);
+            inst->pfn.yuv2planar1((const int16_t*)src1[0], dst1[0], dstW, c->chrDither8, 0);
+            inst->pfn.yuv2planar1((const int16_t*)src2[0], dst2[0], dstW, c->chrDither8, 3);
         } else {
-            ((yuv2planarX_fn)inst->pfn)(filter, inst->filter_size, (const int16_t**)src1, dst1[0], dstW, c->chrDither8, 0);
-            ((yuv2planarX_fn)inst->pfn)(filter, inst->filter_size, (const int16_t**)src2, dst2[0], dstW, c->chrDither8, inst->isMMX ? (c->uv_offx2 >> 1) : 3);
+            inst->pfn.yuv2planarX(filter, inst->filter_size, (const int16_t**)src1, dst1[0], dstW, c->chrDither8, 0);
+            inst->pfn.yuv2planarX(filter, inst->filter_size, (const int16_t**)src2, dst2[0], dstW, c->chrDither8, inst->isMMX ? (c->uv_offx2 >> 1) : 3);
         }
     }
 
     return 1;
 }
 
-static int packed_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int packed_vscale(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     VScalerContext *inst = desc->instance;
     int dstW = desc->dst->width;
@@ -125,13 +133,13 @@ static int packed_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, i
 
 
     if (c->yuv2packed1 && lum_fsize == 1 && chr_fsize == 1) { // unscaled RGB
-        ((yuv2packed1_fn)inst->pfn)(c, (const int16_t*)*src0, (const int16_t**)src1, (const int16_t**)src2,
+        inst->pfn.yuv2packed1(c, (const int16_t*)*src0, (const int16_t**)src1, (const int16_t**)src2,
                                     (const int16_t*)(desc->alpha ? *src3 : NULL),  *dst, dstW, 0, sliceY);
     } else if (c->yuv2packed1 && lum_fsize == 1 && chr_fsize == 2 &&
                chr_filter[2 * chrSliceY + 1] + chr_filter[2 * chrSliceY] == 4096 &&
                chr_filter[2 * chrSliceY + 1] <= 4096U) { // unscaled RGB
         int chrAlpha = chr_filter[2 * chrSliceY + 1];
-        ((yuv2packed1_fn)inst->pfn)(c, (const int16_t*)*src0, (const int16_t**)src1, (const int16_t**)src2,
+        inst->pfn.yuv2packed1(c, (const int16_t*)*src0, (const int16_t**)src1, (const int16_t**)src2,
                                     (const int16_t*)(desc->alpha ? *src3 : NULL),  *dst, dstW, chrAlpha, sliceY);
     } else if (c->yuv2packed2 && lum_fsize == 2 && chr_fsize == 2 &&
                lum_filter[2 * sliceY + 1] + lum_filter[2 * sliceY] == 4096 &&
@@ -145,7 +153,7 @@ static int packed_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, i
         c->lumMmxFilter[3] = lum_filter[2 * sliceY]    * 0x10001;
         c->chrMmxFilter[2] =
         c->chrMmxFilter[3] = chr_filter[2 * chrSliceY] * 0x10001;
-        ((yuv2packed2_fn)inst->pfn)(c, (const int16_t**)src0, (const int16_t**)src1, (const int16_t**)src2, (const int16_t**)src3,
+        inst->pfn.yuv2packed2(c, (const int16_t**)src0, (const int16_t**)src1, (const int16_t**)src2, (const int16_t**)src3,
                     *dst, dstW, lumAlpha, chrAlpha, sliceY);
     } else { // general RGB
         if ((c->yuv2packed1 && lum_fsize == 1 && chr_fsize == 2) ||
@@ -162,7 +170,7 @@ static int packed_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, i
     return 1;
 }
 
-static int any_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int any_vscale(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     VScalerContext *inst = desc->instance;
     int dstW = desc->dst->width;
@@ -195,7 +203,7 @@ static int any_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int 
                         desc->alpha ? desc->dst->plane[3].line[dp3] : NULL };
 
     av_assert1(!c->yuv2packed1 && !c->yuv2packed2);
-    ((yuv2anyX_fn)inst->pfn)(c, lum_filter + sliceY * lum_fsize,
+    inst->pfn.yuv2anyX(c, lum_filter + sliceY * lum_fsize,
              (const int16_t**)src0, lum_fsize, chr_filter + sliceY * chr_fsize,
              (const int16_t**)src1, (const int16_t**)src2, chr_fsize, (const int16_t**)src3, dst, dstW, sliceY);
 
@@ -203,12 +211,12 @@ static int any_vscale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int 
 
 }
 
-int ff_init_vscale(SwsContext *c, SwsFilterDescriptor *desc, SwsSlice *src, SwsSlice *dst)
+int ff_init_vscale(SwsInternal *c, SwsFilterDescriptor *desc, SwsSlice *src, SwsSlice *dst)
 {
     VScalerContext *lumCtx = NULL;
     VScalerContext *chrCtx = NULL;
 
-    if (isPlanarYUV(c->dstFormat) || (isGray(c->dstFormat) && !isALPHA(c->dstFormat))) {
+    if (isPlanarYUV(c->opts.dst_format) || (isGray(c->opts.dst_format) && !isALPHA(c->opts.dst_format))) {
         lumCtx = av_mallocz(sizeof(VScalerContext));
         if (!lumCtx)
             return AVERROR(ENOMEM);
@@ -220,7 +228,7 @@ int ff_init_vscale(SwsContext *c, SwsFilterDescriptor *desc, SwsSlice *src, SwsS
         desc[0].dst = dst;
         desc[0].alpha = c->needAlpha;
 
-        if (!isGray(c->dstFormat)) {
+        if (!isGray(c->opts.dst_format)) {
             chrCtx = av_mallocz(sizeof(VScalerContext));
             if (!chrCtx)
                 return AVERROR(ENOMEM);
@@ -230,7 +238,7 @@ int ff_init_vscale(SwsContext *c, SwsFilterDescriptor *desc, SwsSlice *src, SwsS
             desc[1].dst = dst;
         }
     } else {
-        lumCtx = av_mallocz_array(sizeof(VScalerContext), 2);
+        lumCtx = av_calloc(2, sizeof(*lumCtx));
         if (!lumCtx)
             return AVERROR(ENOMEM);
         chrCtx = &lumCtx[1];
@@ -247,7 +255,7 @@ int ff_init_vscale(SwsContext *c, SwsFilterDescriptor *desc, SwsSlice *src, SwsS
     return 0;
 }
 
-void ff_init_vscale_pfn(SwsContext *c,
+void ff_init_vscale_pfn(SwsInternal *c,
     yuv2planar1_fn yuv2plane1,
     yuv2planarX_fn yuv2planeX,
     yuv2interleavedX_fn yuv2nv12cX,
@@ -260,8 +268,8 @@ void ff_init_vscale_pfn(SwsContext *c,
     VScalerContext *chrCtx = NULL;
     int idx = c->numDesc - (c->is_internal_gamma ? 2 : 1); //FIXME avoid hardcoding indexes
 
-    if (isPlanarYUV(c->dstFormat) || (isGray(c->dstFormat) && !isALPHA(c->dstFormat))) {
-        if (!isGray(c->dstFormat)) {
+    if (isPlanarYUV(c->opts.dst_format) || (isGray(c->opts.dst_format) && !isALPHA(c->opts.dst_format))) {
+        if (!isGray(c->opts.dst_format)) {
             chrCtx = c->desc[idx].instance;
 
             chrCtx->filter[0] = use_mmx ? (int16_t*)c->chrMmxFilter : c->vChrFilter;
@@ -270,9 +278,9 @@ void ff_init_vscale_pfn(SwsContext *c,
             chrCtx->isMMX = use_mmx;
 
             --idx;
-            if (yuv2nv12cX)               chrCtx->pfn = yuv2nv12cX;
-            else if (c->vChrFilterSize == 1) chrCtx->pfn = yuv2plane1;
-            else                             chrCtx->pfn = yuv2planeX;
+            if (yuv2nv12cX)             chrCtx->pfn.yuv2interleavedX = yuv2nv12cX;
+            else if (c->vChrFilterSize == 1) chrCtx->pfn.yuv2planar1 = yuv2plane1;
+            else                             chrCtx->pfn.yuv2planarX = yuv2planeX;
         }
 
         lumCtx = c->desc[idx].instance;
@@ -283,8 +291,8 @@ void ff_init_vscale_pfn(SwsContext *c,
         lumCtx->filter_pos = c->vLumFilterPos;
         lumCtx->isMMX = use_mmx;
 
-        if (c->vLumFilterSize == 1) lumCtx->pfn = yuv2plane1;
-        else                        lumCtx->pfn = yuv2planeX;
+        if (c->vLumFilterSize == 1) lumCtx->pfn.yuv2planar1 = yuv2plane1;
+        else                        lumCtx->pfn.yuv2planarX = yuv2planeX;
 
     } else {
         lumCtx = c->desc[idx].instance;
@@ -303,13 +311,11 @@ void ff_init_vscale_pfn(SwsContext *c,
 
         if (yuv2packedX) {
             if (c->yuv2packed1 && c->vLumFilterSize == 1 && c->vChrFilterSize <= 2)
-                lumCtx->pfn = yuv2packed1;
+                lumCtx->pfn.yuv2packed1 = yuv2packed1;
             else if (c->yuv2packed2 && c->vLumFilterSize == 2 && c->vChrFilterSize == 2)
-                lumCtx->pfn = yuv2packed2;
+                lumCtx->pfn.yuv2packed2 = yuv2packed2;
             lumCtx->yuv2packedX = yuv2packedX;
         } else
-            lumCtx->pfn = yuv2anyX;
+            lumCtx->pfn.yuv2anyX = yuv2anyX;
     }
 }
-
-

@@ -1,4 +1,5 @@
 /*
+ * Copyright (C) 2024 Niklas Haas
  * Copyright (C) 2001-2003 Michael Niedermayer <michaelni@gmx.at>
  *
  * This file is part of FFmpeg.
@@ -34,60 +35,36 @@
 #endif
 #endif
 #if HAVE_VIRTUALALLOC
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #endif
 
 #include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
-#include "libavutil/avutil.h"
-#include "libavutil/bswap.h"
 #include "libavutil/cpu.h"
+#include "libavutil/csp.h"
+#include "libavutil/emms.h"
+#include "libavutil/hdr_dynamic_metadata.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/libm.h"
+#include "libavutil/mastering_display_metadata.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/slicethread.h"
+#include "libavutil/thread.h"
 #include "libavutil/aarch64/cpu.h"
 #include "libavutil/ppc/cpu.h"
 #include "libavutil/x86/asm.h"
 #include "libavutil/x86/cpu.h"
-
-// We have to implement deprecated functions until they are removed, this is the
-// simplest way to prevent warnings
-#undef attribute_deprecated
-#define attribute_deprecated
+#include "libavutil/loongarch/cpu.h"
 
 #include "rgb2rgb.h"
 #include "swscale.h"
 #include "swscale_internal.h"
-
-#if !FF_API_SWS_VECTOR
-static SwsVector *sws_getIdentityVec(void);
-static void sws_addVec(SwsVector *a, SwsVector *b);
-static void sws_shiftVec(SwsVector *a, int shift);
-static void sws_printVec2(SwsVector *a, AVClass *log_ctx, int log_level);
-#endif
-
-static void handle_formats(SwsContext *c);
-
-unsigned swscale_version(void)
-{
-    av_assert0(LIBSWSCALE_VERSION_MICRO >= 100);
-    return LIBSWSCALE_VERSION_INT;
-}
-
-const char *swscale_configuration(void)
-{
-    return FFMPEG_CONFIGURATION;
-}
-
-const char *swscale_license(void)
-{
-#define LICENSE_PREFIX "libswscale license: "
-    return &LICENSE_PREFIX FFMPEG_LICENSE[sizeof(LICENSE_PREFIX) - 1];
-}
+#include "utils.h"
+#include "graph.h"
 
 typedef struct FormatEntry {
     uint8_t is_supported_in         :1;
@@ -234,8 +211,18 @@ static const FormatEntry format_entries[] = {
     [AV_PIX_FMT_GBRAP12BE]   = { 1, 1 },
     [AV_PIX_FMT_GBRP14LE]    = { 1, 1 },
     [AV_PIX_FMT_GBRP14BE]    = { 1, 1 },
+    [AV_PIX_FMT_GBRAP14LE]   = { 1, 1 },
+    [AV_PIX_FMT_GBRAP14BE]   = { 1, 1 },
     [AV_PIX_FMT_GBRP16LE]    = { 1, 1 },
     [AV_PIX_FMT_GBRP16BE]    = { 1, 1 },
+    [AV_PIX_FMT_GBRPF32LE]   = { 1, 1 },
+    [AV_PIX_FMT_GBRPF32BE]   = { 1, 1 },
+    [AV_PIX_FMT_GBRAPF32LE]  = { 1, 1 },
+    [AV_PIX_FMT_GBRAPF32BE]  = { 1, 1 },
+    [AV_PIX_FMT_GBRPF16LE]   = { 1, 0 },
+    [AV_PIX_FMT_GBRPF16BE]   = { 1, 0 },
+    [AV_PIX_FMT_GBRAPF16LE]  = { 1, 0 },
+    [AV_PIX_FMT_GBRAPF16BE]  = { 1, 0 },
     [AV_PIX_FMT_GBRAP]       = { 1, 1 },
     [AV_PIX_FMT_GBRAP16LE]   = { 1, 1 },
     [AV_PIX_FMT_GBRAP16BE]   = { 1, 1 },
@@ -254,19 +241,143 @@ static const FormatEntry format_entries[] = {
     [AV_PIX_FMT_XYZ12BE]     = { 1, 1, 1 },
     [AV_PIX_FMT_XYZ12LE]     = { 1, 1, 1 },
     [AV_PIX_FMT_AYUV64LE]    = { 1, 1},
+    [AV_PIX_FMT_AYUV64BE]    = { 1, 1 },
     [AV_PIX_FMT_P010LE]      = { 1, 1 },
     [AV_PIX_FMT_P010BE]      = { 1, 1 },
+    [AV_PIX_FMT_P012LE]      = { 1, 1 },
+    [AV_PIX_FMT_P012BE]      = { 1, 1 },
     [AV_PIX_FMT_P016LE]      = { 1, 1 },
     [AV_PIX_FMT_P016BE]      = { 1, 1 },
     [AV_PIX_FMT_GRAYF32LE]   = { 1, 1 },
     [AV_PIX_FMT_GRAYF32BE]   = { 1, 1 },
+    [AV_PIX_FMT_GRAYF16LE]   = { 1, 0 },
+    [AV_PIX_FMT_GRAYF16BE]   = { 1, 0 },
     [AV_PIX_FMT_YUVA422P12BE] = { 1, 1 },
     [AV_PIX_FMT_YUVA422P12LE] = { 1, 1 },
     [AV_PIX_FMT_YUVA444P12BE] = { 1, 1 },
     [AV_PIX_FMT_YUVA444P12LE] = { 1, 1 },
     [AV_PIX_FMT_NV24]        = { 1, 1 },
     [AV_PIX_FMT_NV42]        = { 1, 1 },
+    [AV_PIX_FMT_Y210LE]      = { 1, 1 },
+    [AV_PIX_FMT_Y212LE]      = { 1, 1 },
+    [AV_PIX_FMT_Y216LE]      = { 1, 1 },
+    [AV_PIX_FMT_X2RGB10LE]   = { 1, 1 },
+    [AV_PIX_FMT_X2BGR10LE]   = { 1, 1 },
+    [AV_PIX_FMT_P210BE]      = { 1, 1 },
+    [AV_PIX_FMT_P210LE]      = { 1, 1 },
+    [AV_PIX_FMT_P212BE]      = { 1, 1 },
+    [AV_PIX_FMT_P212LE]      = { 1, 1 },
+    [AV_PIX_FMT_P410BE]      = { 1, 1 },
+    [AV_PIX_FMT_P410LE]      = { 1, 1 },
+    [AV_PIX_FMT_P412BE]      = { 1, 1 },
+    [AV_PIX_FMT_P412LE]      = { 1, 1 },
+    [AV_PIX_FMT_P216BE]      = { 1, 1 },
+    [AV_PIX_FMT_P216LE]      = { 1, 1 },
+    [AV_PIX_FMT_P416BE]      = { 1, 1 },
+    [AV_PIX_FMT_P416LE]      = { 1, 1 },
+    [AV_PIX_FMT_NV16]        = { 1, 1 },
+    [AV_PIX_FMT_VUYA]        = { 1, 1 },
+    [AV_PIX_FMT_VUYX]        = { 1, 1 },
+    [AV_PIX_FMT_RGBAF16BE]   = { 1, 0 },
+    [AV_PIX_FMT_RGBAF16LE]   = { 1, 0 },
+    [AV_PIX_FMT_RGBF16BE]    = { 1, 0 },
+    [AV_PIX_FMT_RGBF16LE]    = { 1, 0 },
+    [AV_PIX_FMT_RGBF32BE]    = { 1, 0 },
+    [AV_PIX_FMT_RGBF32LE]    = { 1, 0 },
+    [AV_PIX_FMT_XV30LE]      = { 1, 1 },
+    [AV_PIX_FMT_XV36LE]      = { 1, 1 },
+    [AV_PIX_FMT_XV36BE]      = { 1, 1 },
+    [AV_PIX_FMT_XV48LE]      = { 1, 1 },
+    [AV_PIX_FMT_XV48BE]      = { 1, 1 },
+    [AV_PIX_FMT_AYUV]        = { 1, 1 },
+    [AV_PIX_FMT_UYVA]        = { 1, 1 },
+    [AV_PIX_FMT_VYU444]      = { 1, 1 },
+    [AV_PIX_FMT_V30XLE]      = { 1, 1 },
 };
+
+/**
+ * Allocate and return an SwsContext without performing initialization.
+ */
+static SwsContext *alloc_set_opts(int srcW, int srcH, enum AVPixelFormat srcFormat,
+                                  int dstW, int dstH, enum AVPixelFormat dstFormat,
+                                  int flags, const double *param)
+{
+    SwsContext *sws = sws_alloc_context();
+    if (!sws)
+        return NULL;
+
+    sws->flags = flags;
+    sws->src_w = srcW;
+    sws->src_h = srcH;
+    sws->dst_w = dstW;
+    sws->dst_h      = dstH;
+    sws->src_format = srcFormat;
+    sws->dst_format = dstFormat;
+
+    if (param) {
+        sws->scaler_params[0] = param[0];
+        sws->scaler_params[1] = param[1];
+    }
+
+    return sws;
+}
+
+int ff_shuffle_filter_coefficients(SwsInternal *c, int *filterPos,
+                                   int filterSize, int16_t *filter,
+                                   int dstW)
+{
+#if ARCH_X86_64
+    int i, j, k;
+    int cpu_flags = av_get_cpu_flags();
+    if (!filter)
+        return 0;
+    if (EXTERNAL_AVX2_FAST(cpu_flags) && !(cpu_flags & AV_CPU_FLAG_SLOW_GATHER)) {
+        if ((c->srcBpc == 8) && (c->dstBpc <= 14)) {
+           int16_t *filterCopy = NULL;
+           if (filterSize > 4) {
+               if (!FF_ALLOC_TYPED_ARRAY(filterCopy, dstW * filterSize))
+                   return AVERROR(ENOMEM);
+               memcpy(filterCopy, filter, dstW * filterSize * sizeof(int16_t));
+           }
+           // Do not swap filterPos for pixels which won't be processed by
+           // the main loop.
+           for (i = 0; i + 16 <= dstW; i += 16) {
+               FFSWAP(int, filterPos[i + 2], filterPos[i + 4]);
+               FFSWAP(int, filterPos[i + 3], filterPos[i + 5]);
+               FFSWAP(int, filterPos[i + 10], filterPos[i + 12]);
+               FFSWAP(int, filterPos[i + 11], filterPos[i + 13]);
+           }
+           if (filterSize > 4) {
+               // 16 pixels are processed at a time.
+               for (i = 0; i + 16 <= dstW; i += 16) {
+                   // 4 filter coeffs are processed at a time.
+                   for (k = 0; k + 4 <= filterSize; k += 4) {
+                       for (j = 0; j < 16; ++j) {
+                           int from = (i + j) * filterSize + k;
+                           int to = i * filterSize + j * 4 + k * 16;
+                           memcpy(&filter[to], &filterCopy[from], 4 * sizeof(int16_t));
+                       }
+                   }
+               }
+               // 4 pixels are processed at a time in the tail.
+               for (; i < dstW; i += 4) {
+                   // 4 filter coeffs are processed at a time.
+                   int rem = dstW - i >= 4 ? 4 : dstW - i;
+                   for (k = 0; k + 4 <= filterSize; k += 4) {
+                       for (j = 0; j < rem; ++j) {
+                           int from = (i + j) * filterSize + k;
+                           int to = i * filterSize + j * 4 + k * 4;
+                           memcpy(&filter[to], &filterCopy[from], 4 * sizeof(int16_t));
+                       }
+                   }
+               }
+           }
+           av_free(filterCopy);
+        }
+    }
+#endif
+    return 0;
+}
 
 int sws_isSupportedInput(enum AVPixelFormat pix_fmt)
 {
@@ -299,7 +410,7 @@ static double getSplineCoeff(double a, double b, double c, double d,
                               dist - 1.0);
 }
 
-static av_cold int get_local_pos(SwsContext *s, int chr_subsample, int pos, int dir)
+static av_cold int get_local_pos(SwsInternal *s, int chr_subsample, int pos, int dir)
 {
     if (pos == -1 || pos <= -513) {
         pos = (128 << chr_subsample) - 128;
@@ -347,13 +458,14 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
     emms_c(); // FIXME should not be required but IS (even for non-MMX versions)
 
     // NOTE: the +3 is for the MMX(+1) / SSE(+3) scaler which reads over the end
-    FF_ALLOC_ARRAY_OR_GOTO(NULL, *filterPos, (dstW + 3), sizeof(**filterPos), fail);
+    if (!FF_ALLOC_TYPED_ARRAY(*filterPos, dstW + 3))
+        goto nomem;
 
     if (FFABS(xInc - 0x10000) < 10 && srcPos == dstPos) { // unscaled
         int i;
         filterSize = 1;
-        FF_ALLOCZ_ARRAY_OR_GOTO(NULL, filter,
-                                dstW, sizeof(*filter) * filterSize, fail);
+        if (!FF_ALLOCZ_TYPED_ARRAY(filter, dstW * filterSize))
+            goto nomem;
 
         for (i = 0; i < dstW; i++) {
             filter[i * filterSize] = fone;
@@ -363,8 +475,8 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
         int i;
         int64_t xDstInSrc;
         filterSize = 1;
-        FF_ALLOC_ARRAY_OR_GOTO(NULL, filter,
-                               dstW, sizeof(*filter) * filterSize, fail);
+        if (!FF_ALLOC_TYPED_ARRAY(filter, dstW * filterSize))
+            goto nomem;
 
         xDstInSrc = ((dstPos*(int64_t)xInc)>>8) - ((srcPos*0x8000LL)>>7);
         for (i = 0; i < dstW; i++) {
@@ -379,8 +491,8 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
         int i;
         int64_t xDstInSrc;
         filterSize = 2;
-        FF_ALLOC_ARRAY_OR_GOTO(NULL, filter,
-                               dstW, sizeof(*filter) * filterSize, fail);
+        if (!FF_ALLOC_TYPED_ARRAY(filter, dstW * filterSize))
+            goto nomem;
 
         xDstInSrc = ((dstPos*(int64_t)xInc)>>8) - ((srcPos*0x8000LL)>>7);
         for (i = 0; i < dstW; i++) {
@@ -420,9 +532,8 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
         filterSize = FFMIN(filterSize, srcW - 2);
         filterSize = FFMAX(filterSize, 1);
 
-        FF_ALLOC_ARRAY_OR_GOTO(NULL, filter,
-                               dstW, sizeof(*filter) * filterSize, fail);
-
+        if (!FF_ALLOC_TYPED_ARRAY(filter, dstW * filterSize))
+            goto nomem;
         xDstInSrc = ((dstPos*(int64_t)xInc)>>7) - ((srcPos*0x10000LL)>>7);
         for (i = 0; i < dstW; i++) {
             int xx = (xDstInSrc - (filterSize - 2) * (1LL<<16)) / (1 << 17);
@@ -506,7 +617,7 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
                 filter[i * filterSize + j] = coeff;
                 xx++;
             }
-            xDstInSrc += 2 * xInc;
+            xDstInSrc += 2LL * xInc;
         }
     }
 
@@ -520,8 +631,8 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
     if (dstFilter)
         filter2Size += dstFilter->length - 1;
     av_assert0(filter2Size > 0);
-    FF_ALLOCZ_ARRAY_OR_GOTO(NULL, filter2, dstW, filter2Size * sizeof(*filter2), fail);
-
+    if (!FF_ALLOCZ_TYPED_ARRAY(filter2, dstW * filter2Size))
+        goto nomem;
     for (i = 0; i < dstW; i++) {
         int j, k;
 
@@ -595,9 +706,18 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
             filterAlign = 1;
     }
 
-    if (HAVE_MMX && cpu_flags & AV_CPU_FLAG_MMX) {
+    if (HAVE_MMX && cpu_flags & AV_CPU_FLAG_MMX || have_neon(cpu_flags)) {
         // special case for unscaled vertical filtering
         if (minFilterSize == 1 && filterAlign == 2)
+            filterAlign = 1;
+    }
+
+    if (have_lasx(cpu_flags) || have_lsx(cpu_flags)) {
+        int reNum = minFilterSize & (0x07);
+
+        if (minFilterSize < 5)
+            filterAlign = 4;
+        if (reNum < 3)
             filterAlign = 1;
     }
 
@@ -606,7 +726,7 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
     av_assert0(filterSize > 0);
     filter = av_malloc_array(dstW, filterSize * sizeof(*filter));
     if (!filter)
-        goto fail;
+        goto nomem;
     if (filterSize >= MAX_FILTER_SIZE * 16 /
                       ((flags & SWS_ACCURATE_RND) ? APCK_SIZE : 16)) {
         ret = RETCODE_USE_CASCADE;
@@ -679,8 +799,8 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
 
     // Note the +1 is for the MMX scaler which reads over the end
     /* align at 16 for AltiVec (needed by hScale_altivec_real) */
-    FF_ALLOCZ_ARRAY_OR_GOTO(NULL, *outFilter,
-                            (dstW + 3), *outFilterSize * sizeof(int16_t), fail);
+    if (!FF_ALLOCZ_TYPED_ARRAY(*outFilter, *outFilterSize * (dstW + 3)))
+        goto nomem;
 
     /* normalize & store in outFilter */
     for (i = 0; i < dstW; i++) {
@@ -716,16 +836,19 @@ static av_cold int initFilter(int16_t **outFilter, int32_t **filterPos,
     }
 
     ret = 0;
-
+    goto done;
+nomem:
+    ret = AVERROR(ENOMEM);
 fail:
     if(ret < 0)
         av_log(NULL, ret == RETCODE_USE_CASCADE ? AV_LOG_DEBUG : AV_LOG_ERROR, "sws: initFilter failed\n");
+done:
     av_free(filter);
     av_free(filter2);
     return ret;
 }
 
-static void fill_rgb2yuv_table(SwsContext *c, const int table[4], int dstRange)
+static void fill_rgb2yuv_table(SwsInternal *c, const int table[4], int dstRange)
 {
     int64_t W, V, Z, Cy, Cu, Cv;
     int64_t vr =  table[0];
@@ -819,7 +942,7 @@ static void fill_rgb2yuv_table(SwsContext *c, const int table[4], int dstRange)
         AV_WL16(p + 16*4 + 2*i, map[i] >= 0 ? c->input_rgb2yuv_table[map[i]] : 0);
 }
 
-static void fill_xyztables(struct SwsContext *c)
+static int fill_xyztables(SwsInternal *c)
 {
     int i;
     double xyzgamma = XYZ_GAMMA;
@@ -834,177 +957,43 @@ static void fill_xyztables(struct SwsContext *c)
         {1689, 1464,  739},
         { 871, 2929,  296},
         {  79,  488, 3891} };
-    static int16_t xyzgamma_tab[4096], rgbgamma_tab[4096], xyzgammainv_tab[4096], rgbgammainv_tab[4096];
+#if !CONFIG_SMALL
+    static uint16_t xyzgamma_tab[4096],  rgbgammainv_tab[4096];
+    static uint16_t rgbgamma_tab[65536], xyzgammainv_tab[65536];
+#endif
+    if (c->xyzgamma)
+        return 0;
 
     memcpy(c->xyz2rgb_matrix, xyz2rgb_matrix, sizeof(c->xyz2rgb_matrix));
     memcpy(c->rgb2xyz_matrix, rgb2xyz_matrix, sizeof(c->rgb2xyz_matrix));
+
+#if CONFIG_SMALL
+    c->xyzgamma = av_malloc(sizeof(uint16_t) * 2 * (4096 + 65536));
+    if (!c->xyzgamma)
+        return AVERROR(ENOMEM);
+    c->rgbgammainv = c->xyzgamma + 4096;
+    c->rgbgamma = c->rgbgammainv + 4096;
+    c->xyzgammainv = c->rgbgamma + 65536;
+#else
     c->xyzgamma = xyzgamma_tab;
     c->rgbgamma = rgbgamma_tab;
     c->xyzgammainv = xyzgammainv_tab;
     c->rgbgammainv = rgbgammainv_tab;
-
-    if (rgbgamma_tab[4095])
-        return;
-
-    /* set gamma vectors */
-    for (i = 0; i < 4096; i++) {
-        xyzgamma_tab[i] = lrint(pow(i / 4095.0, xyzgamma) * 4095.0);
-        rgbgamma_tab[i] = lrint(pow(i / 4095.0, rgbgamma) * 4095.0);
-        xyzgammainv_tab[i] = lrint(pow(i / 4095.0, xyzgammainv) * 4095.0);
-        rgbgammainv_tab[i] = lrint(pow(i / 4095.0, rgbgammainv) * 4095.0);
-    }
-}
-
-int sws_setColorspaceDetails(struct SwsContext *c, const int inv_table[4],
-                             int srcRange, const int table[4], int dstRange,
-                             int brightness, int contrast, int saturation)
-{
-    const AVPixFmtDescriptor *desc_dst;
-    const AVPixFmtDescriptor *desc_src;
-    int need_reinit = 0;
-
-    handle_formats(c);
-    desc_dst = av_pix_fmt_desc_get(c->dstFormat);
-    desc_src = av_pix_fmt_desc_get(c->srcFormat);
-
-    if(!isYUV(c->dstFormat) && !isGray(c->dstFormat))
-        dstRange = 0;
-    if(!isYUV(c->srcFormat) && !isGray(c->srcFormat))
-        srcRange = 0;
-
-    if (c->srcRange != srcRange ||
-        c->dstRange != dstRange ||
-        c->brightness != brightness ||
-        c->contrast   != contrast ||
-        c->saturation != saturation ||
-        memcmp(c->srcColorspaceTable, inv_table, sizeof(int) * 4) ||
-        memcmp(c->dstColorspaceTable,     table, sizeof(int) * 4)
-    )
-        need_reinit = 1;
-
-    memmove(c->srcColorspaceTable, inv_table, sizeof(int) * 4);
-    memmove(c->dstColorspaceTable, table, sizeof(int) * 4);
-
-
-
-    c->brightness = brightness;
-    c->contrast   = contrast;
-    c->saturation = saturation;
-    c->srcRange   = srcRange;
-    c->dstRange   = dstRange;
-
-    //The srcBpc check is possibly wrong but we seem to lack a definitive reference to test this
-    //and what we have in ticket 2939 looks better with this check
-    if (need_reinit && (c->srcBpc == 8 || !isYUV(c->srcFormat)))
-        ff_sws_init_range_convert(c);
-
-    c->dstFormatBpp = av_get_bits_per_pixel(desc_dst);
-    c->srcFormatBpp = av_get_bits_per_pixel(desc_src);
-
-    if (c->cascaded_context[c->cascaded_mainindex])
-        return sws_setColorspaceDetails(c->cascaded_context[c->cascaded_mainindex],inv_table, srcRange,table, dstRange, brightness,  contrast, saturation);
-
-    if (!need_reinit)
+    if (xyzgamma_tab[4095])
         return 0;
+#endif
 
-    if ((isYUV(c->dstFormat) || isGray(c->dstFormat)) && (isYUV(c->srcFormat) || isGray(c->srcFormat))) {
-        if (!c->cascaded_context[0] &&
-            memcmp(c->dstColorspaceTable, c->srcColorspaceTable, sizeof(int) * 4) &&
-            c->srcW && c->srcH && c->dstW && c->dstH) {
-            enum AVPixelFormat tmp_format;
-            int tmp_width, tmp_height;
-            int srcW = c->srcW;
-            int srcH = c->srcH;
-            int dstW = c->dstW;
-            int dstH = c->dstH;
-            int ret;
-            av_log(c, AV_LOG_VERBOSE, "YUV color matrix differs for YUV->YUV, using intermediate RGB to convert\n");
-
-            if (isNBPS(c->dstFormat) || is16BPS(c->dstFormat)) {
-                if (isALPHA(c->srcFormat) && isALPHA(c->dstFormat)) {
-                    tmp_format = AV_PIX_FMT_BGRA64;
-                } else {
-                    tmp_format = AV_PIX_FMT_BGR48;
-                }
-            } else {
-                if (isALPHA(c->srcFormat) && isALPHA(c->dstFormat)) {
-                    tmp_format = AV_PIX_FMT_BGRA;
-                } else {
-                    tmp_format = AV_PIX_FMT_BGR24;
-                }
-            }
-
-            if (srcW*srcH > dstW*dstH) {
-                tmp_width  = dstW;
-                tmp_height = dstH;
-            } else {
-                tmp_width  = srcW;
-                tmp_height = srcH;
-            }
-
-            ret = av_image_alloc(c->cascaded_tmp, c->cascaded_tmpStride,
-                                tmp_width, tmp_height, tmp_format, 64);
-            if (ret < 0)
-                return ret;
-
-            c->cascaded_context[0] = sws_alloc_set_opts(srcW, srcH, c->srcFormat,
-                                                        tmp_width, tmp_height, tmp_format,
-                                                        c->flags, c->param);
-            if (!c->cascaded_context[0])
-                return -1;
-
-            c->cascaded_context[0]->alphablend = c->alphablend;
-            ret = sws_init_context(c->cascaded_context[0], NULL , NULL);
-            if (ret < 0)
-                return ret;
-            //we set both src and dst depending on that the RGB side will be ignored
-            sws_setColorspaceDetails(c->cascaded_context[0], inv_table,
-                                     srcRange, table, dstRange,
-                                     brightness, contrast, saturation);
-
-            c->cascaded_context[1] = sws_getContext(tmp_width, tmp_height, tmp_format,
-                                                    dstW, dstH, c->dstFormat,
-                                                    c->flags, NULL, NULL, c->param);
-            if (!c->cascaded_context[1])
-                return -1;
-            sws_setColorspaceDetails(c->cascaded_context[1], inv_table,
-                                     srcRange, table, dstRange,
-                                     0, 1 << 16, 1 << 16);
-            return 0;
-        }
-        return -1;
+    /* set input gamma vectors */
+    for (i = 0; i < 4096; i++) {
+        c->xyzgamma[i]    = lrint(pow(i / 4095.0, xyzgamma) * 65535.0);
+        c->rgbgammainv[i] = lrint(pow(i / 4095.0, rgbgammainv) * 65535.0);
     }
 
-    if (!isYUV(c->dstFormat) && !isGray(c->dstFormat)) {
-        ff_yuv2rgb_c_init_tables(c, inv_table, srcRange, brightness,
-                                 contrast, saturation);
-        // FIXME factorize
-
-        if (ARCH_PPC)
-            ff_yuv2rgb_init_tables_ppc(c, inv_table, brightness,
-                                       contrast, saturation);
+    /* set output gamma vectors */
+    for (i = 0; i < 65536; i++) {
+        c->rgbgamma[i]    = lrint(pow(i / 65535.0, rgbgamma) * 4095.0);
+        c->xyzgammainv[i] = lrint(pow(i / 65535.0, xyzgammainv) * 4095.0);
     }
-
-    fill_rgb2yuv_table(c, table, dstRange);
-
-    return 0;
-}
-
-int sws_getColorspaceDetails(struct SwsContext *c, int **inv_table,
-                             int *srcRange, int **table, int *dstRange,
-                             int *brightness, int *contrast, int *saturation)
-{
-    if (!c )
-        return -1;
-
-    *inv_table  = c->srcColorspaceTable;
-    *table      = c->dstColorspaceTable;
-    *srcRange   = c->srcRange;
-    *dstRange   = c->dstRange;
-    *brightness = c->brightness;
-    *contrast   = c->contrast;
-    *saturation = c->saturation;
-
     return 0;
 }
 
@@ -1066,28 +1055,219 @@ static int handle_xyz(enum AVPixelFormat *format)
     }
 }
 
-static void handle_formats(SwsContext *c)
+static int handle_formats(SwsContext *sws)
 {
-    c->src0Alpha |= handle_0alpha(&c->srcFormat);
-    c->dst0Alpha |= handle_0alpha(&c->dstFormat);
-    c->srcXYZ    |= handle_xyz(&c->srcFormat);
-    c->dstXYZ    |= handle_xyz(&c->dstFormat);
+    SwsInternal *c = sws_internal(sws);
+    c->src0Alpha |= handle_0alpha(&sws->src_format);
+    c->dst0Alpha |= handle_0alpha(&sws->dst_format);
+    c->srcXYZ    |= handle_xyz(&sws->src_format);
+    c->dstXYZ    |= handle_xyz(&sws->dst_format);
     if (c->srcXYZ || c->dstXYZ)
-        fill_xyztables(c);
+        return fill_xyztables(c);
+    else
+        return 0;
+}
+
+static int range_override_needed(enum AVPixelFormat format)
+{
+    return !isYUV(format) && !isGray(format);
+}
+
+int sws_setColorspaceDetails(SwsContext *sws, const int inv_table[4],
+                             int srcRange, const int table[4], int dstRange,
+                             int brightness, int contrast, int saturation)
+{
+    SwsInternal *c = sws_internal(sws);
+    const AVPixFmtDescriptor *desc_dst;
+    const AVPixFmtDescriptor *desc_src;
+    int ret, need_reinit = 0;
+
+    if (c->nb_slice_ctx) {
+        int parent_ret = 0;
+        for (int i = 0; i < c->nb_slice_ctx; i++) {
+            int ret = sws_setColorspaceDetails(c->slice_ctx[i], inv_table,
+                                               srcRange, table, dstRange,
+                                               brightness, contrast, saturation);
+            if (ret < 0)
+                parent_ret = ret;
+        }
+
+        return parent_ret;
+    }
+
+    ret = handle_formats(sws);
+    if (ret < 0)
+        return ret;
+    desc_dst = av_pix_fmt_desc_get(sws->dst_format);
+    desc_src = av_pix_fmt_desc_get(sws->src_format);
+
+    if(range_override_needed(sws->dst_format))
+        dstRange = 0;
+    if(range_override_needed(sws->src_format))
+        srcRange = 0;
+
+    if (sws->src_range != srcRange ||
+        sws->dst_range != dstRange ||
+        c->brightness != brightness ||
+        c->contrast   != contrast ||
+        c->saturation != saturation ||
+        memcmp(c->srcColorspaceTable, inv_table, sizeof(int) * 4) ||
+        memcmp(c->dstColorspaceTable,     table, sizeof(int) * 4)
+    )
+        need_reinit = 1;
+
+    memmove(c->srcColorspaceTable, inv_table, sizeof(int) * 4);
+    memmove(c->dstColorspaceTable, table, sizeof(int) * 4);
+
+
+
+    c->brightness = brightness;
+    c->contrast   = contrast;
+    c->saturation = saturation;
+    sws->src_range = srcRange;
+    sws->dst_range = dstRange;
+
+    if (need_reinit)
+        ff_sws_init_range_convert(c);
+
+    c->dstFormatBpp = av_get_bits_per_pixel(desc_dst);
+    c->srcFormatBpp = av_get_bits_per_pixel(desc_src);
+
+    if (c->cascaded_context[c->cascaded_mainindex])
+        return sws_setColorspaceDetails(c->cascaded_context[c->cascaded_mainindex],inv_table, srcRange,table, dstRange, brightness,  contrast, saturation);
+
+    if (!need_reinit)
+        return 0;
+
+    if ((isYUV(sws->dst_format) || isGray(sws->dst_format)) && (isYUV(sws->src_format) || isGray(sws->src_format))) {
+        if (!c->cascaded_context[0] &&
+            memcmp(c->dstColorspaceTable, c->srcColorspaceTable, sizeof(int) * 4) &&
+            sws->src_w && sws->src_h && sws->dst_w && sws->dst_h) {
+            enum AVPixelFormat tmp_format;
+            int tmp_width, tmp_height;
+            int srcW = sws->src_w;
+            int srcH = sws->src_h;
+            int dstW = sws->dst_w;
+            int dstH = sws->dst_h;
+            int ret;
+            av_log(c, AV_LOG_VERBOSE, "YUV color matrix differs for YUV->YUV, using intermediate RGB to convert\n");
+
+            if (isNBPS(sws->dst_format) || is16BPS(sws->dst_format)) {
+                if (isALPHA(sws->src_format) && isALPHA(sws->dst_format)) {
+                    tmp_format = AV_PIX_FMT_BGRA64;
+                } else {
+                    tmp_format = AV_PIX_FMT_BGR48;
+                }
+            } else {
+                if (isALPHA(sws->src_format) && isALPHA(sws->dst_format)) {
+                    tmp_format = AV_PIX_FMT_BGRA;
+                } else {
+                    tmp_format = AV_PIX_FMT_BGR24;
+                }
+            }
+
+            if (srcW*srcH > dstW*dstH) {
+                tmp_width  = dstW;
+                tmp_height = dstH;
+            } else {
+                tmp_width  = srcW;
+                tmp_height = srcH;
+            }
+
+            ret = av_image_alloc(c->cascaded_tmp[0], c->cascaded_tmpStride[0],
+                                tmp_width, tmp_height, tmp_format, 64);
+            if (ret < 0)
+                return ret;
+
+            c->cascaded_context[0] = alloc_set_opts(srcW, srcH, sws->src_format,
+                                                    tmp_width, tmp_height, tmp_format,
+                                                    sws->flags, sws->scaler_params);
+            if (!c->cascaded_context[0])
+                return -1;
+
+            c->cascaded_context[0]->alpha_blend = sws->alpha_blend;
+            ret = sws_init_context(c->cascaded_context[0], NULL , NULL);
+            if (ret < 0)
+                return ret;
+            //we set both src and dst depending on that the RGB side will be ignored
+            sws_setColorspaceDetails(c->cascaded_context[0], inv_table,
+                                     srcRange, table, dstRange,
+                                     brightness, contrast, saturation);
+
+            c->cascaded_context[1] = alloc_set_opts(tmp_width, tmp_height, tmp_format,
+                                                    dstW, dstH, sws->dst_format,
+                                                    sws->flags, sws->scaler_params);
+            if (!c->cascaded_context[1])
+                return -1;
+            c->cascaded_context[1]->src_range = srcRange;
+            c->cascaded_context[1]->dst_range = dstRange;
+            ret = sws_init_context(c->cascaded_context[1], NULL , NULL);
+            if (ret < 0)
+                return ret;
+            sws_setColorspaceDetails(c->cascaded_context[1], inv_table,
+                                     srcRange, table, dstRange,
+                                     0, 1 << 16, 1 << 16);
+            return 0;
+        }
+        //We do not support this combination currently, we need to cascade more contexts to compensate
+        if (c->cascaded_context[0] && memcmp(c->dstColorspaceTable, c->srcColorspaceTable, sizeof(int) * 4))
+            return -1; //AVERROR_PATCHWELCOME;
+        return 0;
+    }
+
+    if (!isYUV(sws->dst_format) && !isGray(sws->dst_format)) {
+        ff_yuv2rgb_c_init_tables(c, inv_table, srcRange, brightness,
+                                 contrast, saturation);
+        // FIXME factorize
+
+#if ARCH_PPC
+        ff_yuv2rgb_init_tables_ppc(c, inv_table, brightness,
+                                   contrast, saturation);
+#endif
+    }
+
+    fill_rgb2yuv_table(c, table, dstRange);
+
+    return 0;
+}
+
+int sws_getColorspaceDetails(SwsContext *sws, int **inv_table,
+                             int *srcRange, int **table, int *dstRange,
+                             int *brightness, int *contrast, int *saturation)
+{
+    SwsInternal *c = sws_internal(sws);
+    if (!c)
+        return -1;
+
+    if (c->nb_slice_ctx) {
+        return sws_getColorspaceDetails(c->slice_ctx[0], inv_table, srcRange,
+                                        table, dstRange, brightness, contrast,
+                                        saturation);
+    }
+
+    *inv_table  = c->srcColorspaceTable;
+    *table      = c->dstColorspaceTable;
+    *srcRange   = range_override_needed(sws->src_format) ? 1 : sws->src_range;
+    *dstRange   = range_override_needed(sws->dst_format) ? 1 : sws->dst_range;
+    *brightness = c->brightness;
+    *contrast   = c->contrast;
+    *saturation = c->saturation;
+
+    return 0;
 }
 
 SwsContext *sws_alloc_context(void)
 {
-    SwsContext *c = av_mallocz(sizeof(SwsContext));
+    SwsInternal *c = (SwsInternal *) av_mallocz(sizeof(SwsInternal));
+    if (!c)
+        return NULL;
 
-    av_assert0(offsetof(SwsContext, redDither) + DITHER32_INT == offsetof(SwsContext, dither32));
+    c->opts.av_class = &ff_sws_context_class;
+    av_opt_set_defaults(c);
+    atomic_init(&c->stride_unaligned_warned, 0);
+    atomic_init(&c->data_unaligned_warned,   0);
 
-    if (c) {
-        c->av_class = &ff_sws_context_class;
-        av_opt_set_defaults(c);
-    }
-
-    return c;
+    return &c->opts;
 }
 
 static uint16_t * alloc_gamma_tbl(double e)
@@ -1124,6 +1304,9 @@ static enum AVPixelFormat alphaless_fmt(enum AVPixelFormat fmt)
 
     case AV_PIX_FMT_GBRAP12LE:          return AV_PIX_FMT_GBRP12;
     case AV_PIX_FMT_GBRAP12BE:          return AV_PIX_FMT_GBRP12;
+
+    case AV_PIX_FMT_GBRAP14LE:          return AV_PIX_FMT_GBRP14;
+    case AV_PIX_FMT_GBRAP14BE:          return AV_PIX_FMT_GBRP14;
 
     case AV_PIX_FMT_GBRAP16LE:          return AV_PIX_FMT_GBRP16;
     case AV_PIX_FMT_GBRAP16BE:          return AV_PIX_FMT_GBRP16;
@@ -1162,21 +1345,21 @@ static enum AVPixelFormat alphaless_fmt(enum AVPixelFormat fmt)
     }
 }
 
-av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
-                             SwsFilter *dstFilter)
+av_cold int ff_sws_init_single_context(SwsContext *sws, SwsFilter *srcFilter,
+                                       SwsFilter *dstFilter)
 {
     int i;
     int usesVFilter, usesHFilter;
     int unscaled;
+    SwsInternal *c        = sws_internal(sws);
     SwsFilter dummyFilter = { NULL, NULL, NULL, NULL };
-    int srcW              = c->srcW;
-    int srcH              = c->srcH;
-    int dstW              = c->dstW;
-    int dstH              = c->dstH;
+    int srcW              = sws->src_w;
+    int srcH              = sws->src_h;
+    int dstW              = sws->dst_w;
+    int dstH              = sws->dst_h;
     int dst_stride        = FFALIGN(dstW * sizeof(int16_t) + 66, 16);
     int flags, cpu_flags;
-    enum AVPixelFormat srcFormat = c->srcFormat;
-    enum AVPixelFormat dstFormat = c->dstFormat;
+    enum AVPixelFormat srcFormat, dstFormat;
     const AVPixFmtDescriptor *desc_src;
     const AVPixFmtDescriptor *desc_dst;
     int ret = 0;
@@ -1184,46 +1367,40 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
     static const float float_mult = 1.0f / 255.0f;
 
     cpu_flags = av_get_cpu_flags();
-    flags     = c->flags;
+    flags     = sws->flags;
     emms_c();
-    if (!rgb15to16)
-        ff_sws_rgb2rgb_init();
 
     unscaled = (srcW == dstW && srcH == dstH);
 
-    c->srcRange |= handle_jpeg(&c->srcFormat);
-    c->dstRange |= handle_jpeg(&c->dstFormat);
-
-    if(srcFormat!=c->srcFormat || dstFormat!=c->dstFormat)
-        av_log(c, AV_LOG_WARNING, "deprecated pixel format used, make sure you did set range correctly\n");
-
     if (!c->contrast && !c->saturation && !c->dstFormatBpp)
-        sws_setColorspaceDetails(c, ff_yuv2rgb_coeffs[SWS_CS_DEFAULT], c->srcRange,
+        sws_setColorspaceDetails(sws, ff_yuv2rgb_coeffs[SWS_CS_DEFAULT], sws->src_range,
                                  ff_yuv2rgb_coeffs[SWS_CS_DEFAULT],
-                                 c->dstRange, 0, 1 << 16, 1 << 16);
+                                 sws->dst_range, 0, 1 << 16, 1 << 16);
 
-    handle_formats(c);
-    srcFormat = c->srcFormat;
-    dstFormat = c->dstFormat;
+    ret = handle_formats(sws);
+    if (ret < 0)
+        return ret;
+    srcFormat = sws->src_format;
+    dstFormat = sws->dst_format;
     desc_src = av_pix_fmt_desc_get(srcFormat);
     desc_dst = av_pix_fmt_desc_get(dstFormat);
 
     // If the source has no alpha then disable alpha blendaway
     if (c->src0Alpha)
-        c->alphablend = SWS_ALPHA_BLEND_NONE;
+        sws->alpha_blend = SWS_ALPHA_BLEND_NONE;
 
     if (!(unscaled && sws_isSupportedEndiannessConversion(srcFormat) &&
           av_pix_fmt_swap_endianness(srcFormat) == dstFormat)) {
-    if (!sws_isSupportedInput(srcFormat)) {
-        av_log(c, AV_LOG_ERROR, "%s is not supported as input pixel format\n",
-               av_get_pix_fmt_name(srcFormat));
-        return AVERROR(EINVAL);
-    }
-    if (!sws_isSupportedOutput(dstFormat)) {
-        av_log(c, AV_LOG_ERROR, "%s is not supported as output pixel format\n",
-               av_get_pix_fmt_name(dstFormat));
-        return AVERROR(EINVAL);
-    }
+        if (!sws_isSupportedInput(srcFormat)) {
+            av_log(c, AV_LOG_ERROR, "%s is not supported as input pixel format\n",
+                   av_get_pix_fmt_name(srcFormat));
+            return AVERROR(EINVAL);
+        }
+        if (!sws_isSupportedOutput(dstFormat)) {
+            av_log(c, AV_LOG_ERROR, "%s is not supported as output pixel format\n",
+                   av_get_pix_fmt_name(dstFormat));
+            return AVERROR(EINVAL);
+        }
     }
     av_assert2(desc_src && desc_dst);
 
@@ -1247,7 +1424,7 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
             flags |= SWS_BICUBIC;
         else
             flags |= SWS_BICUBIC;
-        c->flags = flags;
+        sws->flags = flags;
     } else if (i & (i - 1)) {
         av_log(c, AV_LOG_ERROR,
                "Exactly one scaler algorithm must be chosen, got %X\n", i);
@@ -1264,7 +1441,7 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
     if (flags & SWS_FAST_BILINEAR) {
         if (srcW < 8 || dstW < 8) {
             flags ^= SWS_FAST_BILINEAR | SWS_BILINEAR;
-            c->flags = flags;
+            sws->flags = flags;
         }
     }
 
@@ -1291,50 +1468,52 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
     av_pix_fmt_get_chroma_sub_sample(srcFormat, &c->chrSrcHSubSample, &c->chrSrcVSubSample);
     av_pix_fmt_get_chroma_sub_sample(dstFormat, &c->chrDstHSubSample, &c->chrDstVSubSample);
 
+    c->dst_slice_align = 1 << c->chrDstVSubSample;
+
     if (isAnyRGB(dstFormat) && !(flags&SWS_FULL_CHR_H_INT)) {
         if (dstW&1) {
             av_log(c, AV_LOG_DEBUG, "Forcing full internal H chroma due to odd output size\n");
             flags |= SWS_FULL_CHR_H_INT;
-            c->flags = flags;
+            sws->flags = flags;
         }
 
         if (   c->chrSrcHSubSample == 0
             && c->chrSrcVSubSample == 0
-            && c->dither != SWS_DITHER_BAYER //SWS_FULL_CHR_H_INT is currently not supported with SWS_DITHER_BAYER
-            && !(c->flags & SWS_FAST_BILINEAR)
+            && sws->dither != SWS_DITHER_BAYER //SWS_FULL_CHR_H_INT is currently not supported with SWS_DITHER_BAYER
+            && !(sws->flags & SWS_FAST_BILINEAR)
         ) {
             av_log(c, AV_LOG_DEBUG, "Forcing full internal H chroma due to input having non subsampled chroma\n");
             flags |= SWS_FULL_CHR_H_INT;
-            c->flags = flags;
+            sws->flags = flags;
         }
     }
 
-    if (c->dither == SWS_DITHER_AUTO) {
+    if (sws->dither == SWS_DITHER_AUTO) {
         if (flags & SWS_ERROR_DIFFUSION)
-            c->dither = SWS_DITHER_ED;
+            sws->dither = SWS_DITHER_ED;
     }
 
     if(dstFormat == AV_PIX_FMT_BGR4_BYTE ||
        dstFormat == AV_PIX_FMT_RGB4_BYTE ||
        dstFormat == AV_PIX_FMT_BGR8 ||
        dstFormat == AV_PIX_FMT_RGB8) {
-        if (c->dither == SWS_DITHER_AUTO)
-            c->dither = (flags & SWS_FULL_CHR_H_INT) ? SWS_DITHER_ED : SWS_DITHER_BAYER;
+        if (sws->dither == SWS_DITHER_AUTO)
+            sws->dither = (flags & SWS_FULL_CHR_H_INT) ? SWS_DITHER_ED : SWS_DITHER_BAYER;
         if (!(flags & SWS_FULL_CHR_H_INT)) {
-            if (c->dither == SWS_DITHER_ED || c->dither == SWS_DITHER_A_DITHER || c->dither == SWS_DITHER_X_DITHER) {
+            if (sws->dither == SWS_DITHER_ED || sws->dither == SWS_DITHER_A_DITHER || sws->dither == SWS_DITHER_X_DITHER || sws->dither == SWS_DITHER_NONE) {
                 av_log(c, AV_LOG_DEBUG,
                     "Desired dithering only supported in full chroma interpolation for destination format '%s'\n",
                     av_get_pix_fmt_name(dstFormat));
                 flags   |= SWS_FULL_CHR_H_INT;
-                c->flags = flags;
+                sws->flags = flags;
             }
         }
         if (flags & SWS_FULL_CHR_H_INT) {
-            if (c->dither == SWS_DITHER_BAYER) {
+            if (sws->dither == SWS_DITHER_BAYER) {
                 av_log(c, AV_LOG_DEBUG,
                     "Ordered dither is not supported in full chroma interpolation for destination format '%s'\n",
                     av_get_pix_fmt_name(dstFormat));
-                c->dither = SWS_DITHER_ED;
+                sws->dither = SWS_DITHER_ED;
             }
         }
     }
@@ -1344,7 +1523,7 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
                    "%s output is not supported with half chroma resolution, switching to full\n",
                    av_get_pix_fmt_name(dstFormat));
             flags   |= SWS_FULL_CHR_H_INT;
-            c->flags = flags;
+            sws->flags = flags;
         }
     }
 
@@ -1370,13 +1549,15 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
         dstFormat != AV_PIX_FMT_BGR4_BYTE &&
         dstFormat != AV_PIX_FMT_RGB4_BYTE &&
         dstFormat != AV_PIX_FMT_BGR8 &&
-        dstFormat != AV_PIX_FMT_RGB8
+        dstFormat != AV_PIX_FMT_RGB8 &&
+        dstFormat != AV_PIX_FMT_X2RGB10LE &&
+        dstFormat != AV_PIX_FMT_X2BGR10LE
     ) {
         av_log(c, AV_LOG_WARNING,
                "full chroma interpolation for destination format '%s' not yet implemented\n",
                av_get_pix_fmt_name(dstFormat));
         flags   &= ~SWS_FULL_CHR_H_INT;
-        c->flags = flags;
+        sws->flags = flags;
     }
     if (isAnyRGB(dstFormat) && !(flags & SWS_FULL_CHR_H_INT))
         c->chrDstHSubSample = 1;
@@ -1388,7 +1569,7 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
 
     /* drop every other pixel for chroma calculation unless user
      * wants full chroma */
-    if (isAnyRGB(srcFormat) && !(flags & SWS_FULL_CHR_H_INP)   &&
+    if (isAnyRGB(srcFormat) && !(srcW & 1) && !(flags & SWS_FULL_CHR_H_INP) &&
         srcFormat != AV_PIX_FMT_RGB8 && srcFormat != AV_PIX_FMT_BGR8 &&
         srcFormat != AV_PIX_FMT_RGB4 && srcFormat != AV_PIX_FMT_BGR4 &&
         srcFormat != AV_PIX_FMT_RGB4_BYTE && srcFormat != AV_PIX_FMT_BGR4_BYTE &&
@@ -1397,9 +1578,14 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
         srcFormat != AV_PIX_FMT_GBRAP10BE && srcFormat != AV_PIX_FMT_GBRAP10LE &&
         srcFormat != AV_PIX_FMT_GBRP12BE  && srcFormat != AV_PIX_FMT_GBRP12LE &&
         srcFormat != AV_PIX_FMT_GBRAP12BE && srcFormat != AV_PIX_FMT_GBRAP12LE &&
+        srcFormat != AV_PIX_FMT_GBRAP14BE && srcFormat != AV_PIX_FMT_GBRAP14LE &&
         srcFormat != AV_PIX_FMT_GBRP14BE  && srcFormat != AV_PIX_FMT_GBRP14LE &&
         srcFormat != AV_PIX_FMT_GBRP16BE  && srcFormat != AV_PIX_FMT_GBRP16LE &&
         srcFormat != AV_PIX_FMT_GBRAP16BE  && srcFormat != AV_PIX_FMT_GBRAP16LE &&
+        srcFormat != AV_PIX_FMT_GBRPF32BE  && srcFormat != AV_PIX_FMT_GBRPF32LE &&
+        srcFormat != AV_PIX_FMT_GBRAPF32BE && srcFormat != AV_PIX_FMT_GBRAPF32LE &&
+        srcFormat != AV_PIX_FMT_GBRPF16BE  && srcFormat != AV_PIX_FMT_GBRPF16LE &&
+        srcFormat != AV_PIX_FMT_GBRAPF16BE && srcFormat != AV_PIX_FMT_GBRAPF16LE &&
         ((dstW >> c->chrDstHSubSample) <= (srcW >> 1) ||
          (flags & SWS_FAST_BILINEAR)))
         c->chrSrcHSubSample = 1;
@@ -1410,7 +1596,8 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
     c->chrDstW = AV_CEIL_RSHIFT(dstW, c->chrDstHSubSample);
     c->chrDstH = AV_CEIL_RSHIFT(dstH, c->chrDstVSubSample);
 
-    FF_ALLOCZ_OR_GOTO(c, c->formatConvBuffer, FFALIGN(srcW*2+78, 16) * 2, fail);
+    if (!FF_ALLOCZ_TYPED_ARRAY(c->formatConvBuffer, FFALIGN(srcW * 2 + 78, 16) * 2))
+        goto nomem;
 
     c->srcBpc = desc_src->comp[0].depth;
     if (c->srcBpc < 8)
@@ -1434,7 +1621,7 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
                 av_log(c, AV_LOG_INFO,
                        "output width is not a multiple of 32 -> no MMXEXT scaler\n");
         }
-        if (usesHFilter || isNBPS(c->srcFormat) || is16BPS(c->srcFormat) || isAnyRGB(c->srcFormat))
+        if (usesHFilter || isNBPS(sws->src_format) || is16BPS(sws->src_format) || isAnyRGB(sws->src_format))
             c->canMMXEXTBeUsed = 0;
     } else
         c->canMMXEXTBeUsed = 0;
@@ -1465,31 +1652,32 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
     c->gamma_value = 2.2;
     tmpFmt = AV_PIX_FMT_RGBA64LE;
 
-
-    if (!unscaled && c->gamma_flag && (srcFormat != tmpFmt || dstFormat != tmpFmt)) {
-        SwsContext *c2;
+    if (!unscaled && sws->gamma_flag && (srcFormat != tmpFmt || dstFormat != tmpFmt)) {
+        SwsInternal *c2;
         c->cascaded_context[0] = NULL;
 
-        ret = av_image_alloc(c->cascaded_tmp, c->cascaded_tmpStride,
+        ret = av_image_alloc(c->cascaded_tmp[0], c->cascaded_tmpStride[0],
                             srcW, srcH, tmpFmt, 64);
         if (ret < 0)
             return ret;
 
         c->cascaded_context[0] = sws_getContext(srcW, srcH, srcFormat,
                                                 srcW, srcH, tmpFmt,
-                                                flags, NULL, NULL, c->param);
+                                                flags, NULL, NULL,
+                                                sws->scaler_params);
         if (!c->cascaded_context[0]) {
-            return -1;
+            return AVERROR(ENOMEM);
         }
 
         c->cascaded_context[1] = sws_getContext(srcW, srcH, tmpFmt,
                                                 dstW, dstH, tmpFmt,
-                                                flags, srcFilter, dstFilter, c->param);
+                                                flags, srcFilter, dstFilter,
+                                                sws->scaler_params);
 
         if (!c->cascaded_context[1])
-            return -1;
+            return AVERROR(ENOMEM);
 
-        c2 = c->cascaded_context[1];
+        c2 = sws_internal(c->cascaded_context[1]);
         c2->is_internal_gamma = 1;
         c2->gamma     = alloc_gamma_tbl(    c->gamma_value);
         c2->inv_gamma = alloc_gamma_tbl(1.f/c->gamma_value);
@@ -1500,48 +1688,53 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
         // to properly create the gamma convert FilterDescriptor
         // we have to re-initialize it
         ff_free_filters(c2);
-        if (ff_init_filters(c2) < 0) {
-            sws_freeContext(c2);
-            return -1;
+        if ((ret = ff_init_filters(c2)) < 0) {
+            sws_freeContext(c->cascaded_context[1]);
+            c->cascaded_context[1] = NULL;
+            return ret;
         }
 
         c->cascaded_context[2] = NULL;
         if (dstFormat != tmpFmt) {
-            ret = av_image_alloc(c->cascaded1_tmp, c->cascaded1_tmpStride,
+            ret = av_image_alloc(c->cascaded_tmp[1], c->cascaded_tmpStride[1],
                                 dstW, dstH, tmpFmt, 64);
             if (ret < 0)
                 return ret;
 
             c->cascaded_context[2] = sws_getContext(dstW, dstH, tmpFmt,
-                                                dstW, dstH, dstFormat,
-                                                flags, NULL, NULL, c->param);
+                                                    dstW, dstH, dstFormat,
+                                                    flags, NULL, NULL,
+                                                    sws->scaler_params);
             if (!c->cascaded_context[2])
-                return -1;
+                return AVERROR(ENOMEM);
         }
         return 0;
     }
 
     if (isBayer(srcFormat)) {
         if (!unscaled ||
-            (dstFormat != AV_PIX_FMT_RGB24 && dstFormat != AV_PIX_FMT_YUV420P)) {
-            enum AVPixelFormat tmpFormat = AV_PIX_FMT_RGB24;
+            (dstFormat != AV_PIX_FMT_RGB24 && dstFormat != AV_PIX_FMT_YUV420P &&
+             dstFormat != AV_PIX_FMT_RGB48)) {
+            enum AVPixelFormat tmpFormat = isBayer16BPS(srcFormat) ? AV_PIX_FMT_RGB48 : AV_PIX_FMT_RGB24;
 
-            ret = av_image_alloc(c->cascaded_tmp, c->cascaded_tmpStride,
+            ret = av_image_alloc(c->cascaded_tmp[0], c->cascaded_tmpStride[0],
                                 srcW, srcH, tmpFormat, 64);
             if (ret < 0)
                 return ret;
 
             c->cascaded_context[0] = sws_getContext(srcW, srcH, srcFormat,
                                                     srcW, srcH, tmpFormat,
-                                                    flags, srcFilter, NULL, c->param);
+                                                    flags, srcFilter, NULL,
+                                                    sws->scaler_params);
             if (!c->cascaded_context[0])
-                return -1;
+                return AVERROR(ENOMEM);
 
             c->cascaded_context[1] = sws_getContext(srcW, srcH, tmpFormat,
                                                     dstW, dstH, dstFormat,
-                                                    flags, NULL, dstFilter, c->param);
+                                                    flags, NULL, dstFilter,
+                                                    sws->scaler_params);
             if (!c->cascaded_context[1])
-                return -1;
+                return AVERROR(ENOMEM);
             return 0;
         }
     }
@@ -1562,40 +1755,73 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
     if (CONFIG_SWSCALE_ALPHA && isALPHA(srcFormat) && !isALPHA(dstFormat)) {
         enum AVPixelFormat tmpFormat = alphaless_fmt(srcFormat);
 
-        if (tmpFormat != AV_PIX_FMT_NONE && c->alphablend != SWS_ALPHA_BLEND_NONE)
-        if (!unscaled ||
-            dstFormat != tmpFormat ||
-            usesHFilter || usesVFilter ||
-            c->srcRange != c->dstRange
-        ) {
-            c->cascaded_mainindex = 1;
-            ret = av_image_alloc(c->cascaded_tmp, c->cascaded_tmpStride,
-                                srcW, srcH, tmpFormat, 64);
-            if (ret < 0)
-                return ret;
+        if (tmpFormat != AV_PIX_FMT_NONE && sws->alpha_blend != SWS_ALPHA_BLEND_NONE) {
+            if (!unscaled ||
+                dstFormat != tmpFormat ||
+                usesHFilter || usesVFilter ||
+                sws->src_range != sws->dst_range
+            ) {
+                c->cascaded_mainindex = 1;
+                ret = av_image_alloc(c->cascaded_tmp[0], c->cascaded_tmpStride[0],
+                                     srcW, srcH, tmpFormat, 64);
+                if (ret < 0)
+                    return ret;
 
-            c->cascaded_context[0] = sws_alloc_set_opts(srcW, srcH, srcFormat,
+                c->cascaded_context[0] = alloc_set_opts(srcW, srcH, srcFormat,
                                                         srcW, srcH, tmpFormat,
-                                                        flags, c->param);
-            if (!c->cascaded_context[0])
-                return -1;
-            c->cascaded_context[0]->alphablend = c->alphablend;
-            ret = sws_init_context(c->cascaded_context[0], NULL , NULL);
-            if (ret < 0)
-                return ret;
+                                                        flags, sws->scaler_params);
+                if (!c->cascaded_context[0])
+                    return AVERROR(EINVAL);
+                c->cascaded_context[0]->alpha_blend = sws->alpha_blend;
+                ret = sws_init_context(c->cascaded_context[0], NULL , NULL);
+                if (ret < 0)
+                    return ret;
 
-            c->cascaded_context[1] = sws_alloc_set_opts(srcW, srcH, tmpFormat,
+                c->cascaded_context[1] = alloc_set_opts(srcW, srcH, tmpFormat,
                                                         dstW, dstH, dstFormat,
-                                                        flags, c->param);
-            if (!c->cascaded_context[1])
-                return -1;
+                                                        flags, sws->scaler_params);
+                if (!c->cascaded_context[1])
+                    return AVERROR(EINVAL);
 
-            c->cascaded_context[1]->srcRange = c->srcRange;
-            c->cascaded_context[1]->dstRange = c->dstRange;
-            ret = sws_init_context(c->cascaded_context[1], srcFilter , dstFilter);
-            if (ret < 0)
-                return ret;
+                c->cascaded_context[1]->src_range = sws->src_range;
+                c->cascaded_context[1]->dst_range = sws->dst_range;
+                ret = sws_init_context(c->cascaded_context[1], srcFilter , dstFilter);
+                if (ret < 0)
+                    return ret;
 
+                return 0;
+            }
+        }
+    }
+
+    /* alpha blend special case, note this has been split via cascaded contexts if its scaled */
+    if (unscaled && !usesHFilter && !usesVFilter &&
+        sws->alpha_blend != SWS_ALPHA_BLEND_NONE &&
+        isALPHA(srcFormat) &&
+        (sws->src_range == sws->dst_range || isAnyRGB(dstFormat)) &&
+        alphaless_fmt(srcFormat) == dstFormat
+    ) {
+        c->convert_unscaled = ff_sws_alphablendaway;
+
+        if (flags & SWS_PRINT_INFO)
+            av_log(c, AV_LOG_INFO,
+                    "using alpha blendaway %s -> %s special converter\n",
+                    av_get_pix_fmt_name(srcFormat), av_get_pix_fmt_name(dstFormat));
+        return 0;
+    }
+
+    /* unscaled special cases */
+    if (unscaled && !usesHFilter && !usesVFilter &&
+        (sws->src_range == sws->dst_range || isAnyRGB(dstFormat) ||
+         isFloat(srcFormat) || isFloat(dstFormat) || isBayer(srcFormat))){
+
+        ff_get_unscaled_swscale(c);
+
+        if (c->convert_unscaled) {
+            if (flags & SWS_PRINT_INFO)
+                av_log(c, AV_LOG_INFO,
+                       "using unscaled %s -> %s special converter\n",
+                       av_get_pix_fmt_name(srcFormat), av_get_pix_fmt_name(dstFormat));
             return 0;
         }
     }
@@ -1649,10 +1875,11 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
                 return AVERROR(ENOMEM);
             }
 
-            FF_ALLOCZ_OR_GOTO(c, c->hLumFilter,    (dstW           / 8 + 8) * sizeof(int16_t), fail);
-            FF_ALLOCZ_OR_GOTO(c, c->hChrFilter,    (c->chrDstW     / 4 + 8) * sizeof(int16_t), fail);
-            FF_ALLOCZ_OR_GOTO(c, c->hLumFilterPos, (dstW       / 2 / 8 + 8) * sizeof(int32_t), fail);
-            FF_ALLOCZ_OR_GOTO(c, c->hChrFilterPos, (c->chrDstW / 2 / 4 + 8) * sizeof(int32_t), fail);
+            if (!FF_ALLOCZ_TYPED_ARRAY(c->hLumFilter,    dstW           / 8 + 8) ||
+                !FF_ALLOCZ_TYPED_ARRAY(c->hChrFilter,    c->chrDstW     / 4 + 8) ||
+                !FF_ALLOCZ_TYPED_ARRAY(c->hLumFilterPos, dstW       / 2 / 8 + 8) ||
+                !FF_ALLOCZ_TYPED_ARRAY(c->hChrFilterPos, c->chrDstW / 2 / 4 + 8))
+                goto nomem;
 
             ff_init_hscaler_mmxext(      dstW, c->lumXInc, c->lumMmxextFilterCode,
                                 c->hLumFilter, (uint32_t*)c->hLumFilterPos, 8);
@@ -1663,6 +1890,7 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
             if (   mprotect(c->lumMmxextFilterCode, c->lumMmxextFilterCodeSize, PROT_EXEC | PROT_READ) == -1
                 || mprotect(c->chrMmxextFilterCode, c->chrMmxextFilterCodeSize, PROT_EXEC | PROT_READ) == -1) {
                 av_log(c, AV_LOG_ERROR, "mprotect failed, cannot use fast bilinear scaler\n");
+                ret = AVERROR(EINVAL);
                 goto fail;
             }
 #endif
@@ -1671,26 +1899,32 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
         {
             const int filterAlign = X86_MMX(cpu_flags)     ? 4 :
                                     PPC_ALTIVEC(cpu_flags) ? 8 :
-                                    have_neon(cpu_flags)   ? 8 : 1;
+                                    have_neon(cpu_flags)   ? 4 :
+                                    have_lsx(cpu_flags)    ? 8 :
+                                    have_lasx(cpu_flags)   ? 8 : 1;
 
             if ((ret = initFilter(&c->hLumFilter, &c->hLumFilterPos,
                            &c->hLumFilterSize, c->lumXInc,
                            srcW, dstW, filterAlign, 1 << 14,
                            (flags & SWS_BICUBLIN) ? (flags | SWS_BICUBIC) : flags,
                            cpu_flags, srcFilter->lumH, dstFilter->lumH,
-                           c->param,
+                           sws->scaler_params,
                            get_local_pos(c, 0, 0, 0),
                            get_local_pos(c, 0, 0, 0))) < 0)
                 goto fail;
+            if (ff_shuffle_filter_coefficients(c, c->hLumFilterPos, c->hLumFilterSize, c->hLumFilter, dstW) < 0)
+                goto nomem;
             if ((ret = initFilter(&c->hChrFilter, &c->hChrFilterPos,
                            &c->hChrFilterSize, c->chrXInc,
                            c->chrSrcW, c->chrDstW, filterAlign, 1 << 14,
                            (flags & SWS_BICUBLIN) ? (flags | SWS_BILINEAR) : flags,
                            cpu_flags, srcFilter->chrH, dstFilter->chrH,
-                           c->param,
-                           get_local_pos(c, c->chrSrcHSubSample, c->src_h_chr_pos, 0),
-                           get_local_pos(c, c->chrDstHSubSample, c->dst_h_chr_pos, 0))) < 0)
+                           sws->scaler_params,
+                           get_local_pos(c, c->chrSrcHSubSample, sws->src_h_chr_pos, 0),
+                           get_local_pos(c, c->chrDstHSubSample, sws->dst_h_chr_pos, 0))) < 0)
                 goto fail;
+            if (ff_shuffle_filter_coefficients(c, c->hChrFilterPos, c->hChrFilterSize, c->hChrFilter, c->chrDstW) < 0)
+                goto nomem;
         }
     } // initialize horizontal stuff
 
@@ -1704,7 +1938,7 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
                        c->lumYInc, srcH, dstH, filterAlign, (1 << 12),
                        (flags & SWS_BICUBLIN) ? (flags | SWS_BICUBIC) : flags,
                        cpu_flags, srcFilter->lumV, dstFilter->lumV,
-                       c->param,
+                       sws->scaler_params,
                        get_local_pos(c, 0, 0, 1),
                        get_local_pos(c, 0, 0, 1))) < 0)
             goto fail;
@@ -1713,17 +1947,18 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
                        filterAlign, (1 << 12),
                        (flags & SWS_BICUBLIN) ? (flags | SWS_BILINEAR) : flags,
                        cpu_flags, srcFilter->chrV, dstFilter->chrV,
-                       c->param,
-                       get_local_pos(c, c->chrSrcVSubSample, c->src_v_chr_pos, 1),
-                       get_local_pos(c, c->chrDstVSubSample, c->dst_v_chr_pos, 1))) < 0)
+                       sws->scaler_params,
+                       get_local_pos(c, c->chrSrcVSubSample, sws->src_v_chr_pos, 1),
+                       get_local_pos(c, c->chrDstVSubSample, sws->dst_v_chr_pos, 1))) < 0)
 
             goto fail;
 
 #if HAVE_ALTIVEC
-        FF_ALLOC_OR_GOTO(c, c->vYCoeffsBank, sizeof(vector signed short) * c->vLumFilterSize * c->dstH,    fail);
-        FF_ALLOC_OR_GOTO(c, c->vCCoeffsBank, sizeof(vector signed short) * c->vChrFilterSize * c->chrDstH, fail);
+        if (!FF_ALLOC_TYPED_ARRAY(c->vYCoeffsBank, c->vLumFilterSize * sws->dst_h) ||
+            !FF_ALLOC_TYPED_ARRAY(c->vCCoeffsBank, c->vChrFilterSize * c->chrDstH))
+            goto nomem;
 
-        for (i = 0; i < c->vLumFilterSize * c->dstH; i++) {
+        for (i = 0; i < c->vLumFilterSize * sws->dst_h; i++) {
             int j;
             short *p = (short *)&c->vYCoeffsBank[i];
             for (j = 0; j < 8; j++)
@@ -1740,9 +1975,10 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
     }
 
     for (i = 0; i < 4; i++)
-        FF_ALLOCZ_OR_GOTO(c, c->dither_error[i], (c->dstW+2) * sizeof(int), fail);
+        if (!FF_ALLOCZ_TYPED_ARRAY(c->dither_error[i], sws->dst_w + 3))
+            goto nomem;
 
-    c->needAlpha = (CONFIG_SWSCALE_ALPHA && isALPHA(c->srcFormat) && isALPHA(c->dstFormat)) ? 1 : 0;
+    c->needAlpha = (CONFIG_SWSCALE_ALPHA && isALPHA(sws->src_format) && isALPHA(sws->dst_format)) ? 1 : 0;
 
     // 64 / c->scalingBpp is the same as 16 / sizeof(scaling_intermediate)
     c->uv_off   = (dst_stride>>1) + 64 / (c->dstBpc &~ 7);
@@ -1764,20 +2000,14 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
         av_log(c, AV_LOG_INFO, "%s scaler, from %s to %s%s ",
                scaler,
                av_get_pix_fmt_name(srcFormat),
-#ifdef DITHER1XBPP
                dstFormat == AV_PIX_FMT_BGR555   || dstFormat == AV_PIX_FMT_BGR565   ||
                dstFormat == AV_PIX_FMT_RGB444BE || dstFormat == AV_PIX_FMT_RGB444LE ||
                dstFormat == AV_PIX_FMT_BGR444BE || dstFormat == AV_PIX_FMT_BGR444LE ?
                                                              "dithered " : "",
-#else
-               "",
-#endif
                av_get_pix_fmt_name(dstFormat));
 
         if (INLINE_MMXEXT(cpu_flags))
             cpucaps = "MMXEXT";
-        else if (INLINE_AMD3DNOW(cpu_flags))
-            cpucaps = "3DNOW";
         else if (INLINE_MMX(cpu_flags))
             cpucaps = "MMX";
         else if (PPC_ALTIVEC(cpu_flags))
@@ -1790,46 +2020,18 @@ av_cold int sws_init_context(SwsContext *c, SwsFilter *srcFilter,
         av_log(c, AV_LOG_VERBOSE, "%dx%d -> %dx%d\n", srcW, srcH, dstW, dstH);
         av_log(c, AV_LOG_DEBUG,
                "lum srcW=%d srcH=%d dstW=%d dstH=%d xInc=%d yInc=%d\n",
-               c->srcW, c->srcH, c->dstW, c->dstH, c->lumXInc, c->lumYInc);
+               sws->src_w, sws->src_h, sws->dst_w, sws->dst_h, c->lumXInc, c->lumYInc);
         av_log(c, AV_LOG_DEBUG,
                "chr srcW=%d srcH=%d dstW=%d dstH=%d xInc=%d yInc=%d\n",
                c->chrSrcW, c->chrSrcH, c->chrDstW, c->chrDstH,
                c->chrXInc, c->chrYInc);
     }
 
-    /* alpha blend special case, note this has been split via cascaded contexts if its scaled */
-    if (unscaled && !usesHFilter && !usesVFilter &&
-        c->alphablend != SWS_ALPHA_BLEND_NONE &&
-        isALPHA(srcFormat) &&
-        (c->srcRange == c->dstRange || isAnyRGB(dstFormat)) &&
-        alphaless_fmt(srcFormat) == dstFormat
-    ) {
-        c->swscale = ff_sws_alphablendaway;
+    ff_sws_init_scale(c);
 
-        if (flags & SWS_PRINT_INFO)
-            av_log(c, AV_LOG_INFO,
-                    "using alpha blendaway %s -> %s special converter\n",
-                    av_get_pix_fmt_name(srcFormat), av_get_pix_fmt_name(dstFormat));
-        return 0;
-    }
-
-    /* unscaled special cases */
-    if (unscaled && !usesHFilter && !usesVFilter &&
-        (c->srcRange == c->dstRange || isAnyRGB(dstFormat) ||
-         isFloat(srcFormat) || isFloat(dstFormat))){
-        ff_get_unscaled_swscale(c);
-
-        if (c->swscale) {
-            if (flags & SWS_PRINT_INFO)
-                av_log(c, AV_LOG_INFO,
-                       "using unscaled %s -> %s special converter\n",
-                       av_get_pix_fmt_name(srcFormat), av_get_pix_fmt_name(dstFormat));
-            return 0;
-        }
-    }
-
-    c->swscale = ff_getSwsFunc(c);
     return ff_init_filters(c);
+nomem:
+    ret = AVERROR(ENOMEM);
 fail: // FIXME replace things by appropriate error codes
     if (ret == RETCODE_USE_CASCADE)  {
         int tmpW = sqrt(srcW * (int64_t)dstW);
@@ -1842,50 +2044,109 @@ fail: // FIXME replace things by appropriate error codes
         if (srcW*(int64_t)srcH <= 4LL*dstW*dstH)
             return AVERROR(EINVAL);
 
-        ret = av_image_alloc(c->cascaded_tmp, c->cascaded_tmpStride,
+        ret = av_image_alloc(c->cascaded_tmp[0], c->cascaded_tmpStride[0],
                              tmpW, tmpH, tmpFormat, 64);
         if (ret < 0)
             return ret;
 
         c->cascaded_context[0] = sws_getContext(srcW, srcH, srcFormat,
                                                 tmpW, tmpH, tmpFormat,
-                                                flags, srcFilter, NULL, c->param);
+                                                flags, srcFilter, NULL,
+                                                sws->scaler_params);
         if (!c->cascaded_context[0])
-            return -1;
+            return AVERROR(ENOMEM);
 
         c->cascaded_context[1] = sws_getContext(tmpW, tmpH, tmpFormat,
                                                 dstW, dstH, dstFormat,
-                                                flags, NULL, dstFilter, c->param);
+                                                flags, NULL, dstFilter,
+                                                sws->scaler_params);
         if (!c->cascaded_context[1])
-            return -1;
+            return AVERROR(ENOMEM);
         return 0;
     }
-    return -1;
+    return ret;
 }
 
-SwsContext *sws_alloc_set_opts(int srcW, int srcH, enum AVPixelFormat srcFormat,
-                               int dstW, int dstH, enum AVPixelFormat dstFormat,
-                               int flags, const double *param)
+static int context_init_threaded(SwsContext *sws,
+                                 SwsFilter *src_filter, SwsFilter *dst_filter)
 {
-    SwsContext *c;
+    SwsInternal *c = sws_internal(sws);
+    int ret;
 
-    if (!(c = sws_alloc_context()))
-        return NULL;
+    ret = avpriv_slicethread_create(&c->slicethread, (void*) sws,
+                                    ff_sws_slice_worker, NULL, sws->threads);
+    if (ret == AVERROR(ENOSYS)) {
+        sws->threads = 1;
+        return 0;
+    } else if (ret < 0)
+        return ret;
 
-    c->flags     = flags;
-    c->srcW      = srcW;
-    c->srcH      = srcH;
-    c->dstW      = dstW;
-    c->dstH      = dstH;
-    c->srcFormat = srcFormat;
-    c->dstFormat = dstFormat;
+    sws->threads = ret;
 
-    if (param) {
-        c->param[0] = param[0];
-        c->param[1] = param[1];
+    c->slice_ctx = av_calloc(sws->threads, sizeof(*c->slice_ctx));
+    c->slice_err = av_calloc(sws->threads, sizeof(*c->slice_err));
+    if (!c->slice_ctx || !c->slice_err)
+        return AVERROR(ENOMEM);
+
+    for (int i = 0; i < sws->threads; i++) {
+        SwsContext *slice;
+        slice = c->slice_ctx[i] = sws_alloc_context();
+        if (!slice)
+            return AVERROR(ENOMEM);
+        sws_internal(slice)->parent = sws;
+        c->nb_slice_ctx++;
+
+        ret = av_opt_copy(slice, sws);
+        if (ret < 0)
+            return ret;
+        slice->threads = 1;
+
+        ret = ff_sws_init_single_context(slice, src_filter, dst_filter);
+        if (ret < 0)
+            return ret;
+
+        if (slice->dither == SWS_DITHER_ED) {
+            av_log(c, AV_LOG_VERBOSE,
+                   "Error-diffusion dither is in use, scaling will be single-threaded.");
+            break;
+        }
     }
 
-    return c;
+    return 0;
+}
+
+av_cold int sws_init_context(SwsContext *sws, SwsFilter *srcFilter,
+                             SwsFilter *dstFilter)
+{
+    SwsInternal *c = sws_internal(sws);
+    static AVOnce rgb2rgb_once = AV_ONCE_INIT;
+    enum AVPixelFormat src_format, dst_format;
+    int ret;
+
+    c->frame_src = av_frame_alloc();
+    c->frame_dst = av_frame_alloc();
+    if (!c->frame_src || !c->frame_dst)
+        return AVERROR(ENOMEM);
+
+    if (ff_thread_once(&rgb2rgb_once, ff_sws_rgb2rgb_init) != 0)
+        return AVERROR_UNKNOWN;
+
+    src_format = sws->src_format;
+    dst_format = sws->dst_format;
+    sws->src_range |= handle_jpeg(&sws->src_format);
+    sws->dst_range |= handle_jpeg(&sws->dst_format);
+
+    if (src_format != sws->src_format || dst_format != sws->dst_format)
+        av_log(c, AV_LOG_WARNING, "deprecated pixel format used, make sure you did set range correctly\n");
+
+    if (sws->threads != 1) {
+        ret = context_init_threaded(sws, srcFilter, dstFilter);
+        if (ret < 0 || sws->threads > 1)
+            return ret;
+        // threading disabled in this build, init as single-threaded
+    }
+
+    return ff_sws_init_single_context(sws, srcFilter, dstFilter);
 }
 
 SwsContext *sws_getContext(int srcW, int srcH, enum AVPixelFormat srcFormat,
@@ -1893,20 +2154,20 @@ SwsContext *sws_getContext(int srcW, int srcH, enum AVPixelFormat srcFormat,
                            int flags, SwsFilter *srcFilter,
                            SwsFilter *dstFilter, const double *param)
 {
-    SwsContext *c;
+    SwsContext *sws;
 
-    c = sws_alloc_set_opts(srcW, srcH, srcFormat,
-                           dstW, dstH, dstFormat,
-                           flags, param);
-    if (!c)
+    sws = alloc_set_opts(srcW, srcH, srcFormat,
+                         dstW, dstH, dstFormat,
+                         flags, param);
+    if (!sws)
         return NULL;
 
-    if (sws_init_context(c, srcFilter, dstFilter) < 0) {
-        sws_freeContext(c);
+    if (sws_init_context(sws, srcFilter, dstFilter) < 0) {
+        sws_freeContext(sws);
         return NULL;
     }
 
-    return c;
+    return sws;
 }
 
 static int isnan_vec(SwsVector *a)
@@ -1923,6 +2184,217 @@ static void makenan_vec(SwsVector *a)
     int i;
     for (i=0; i<a->length; i++)
         a->coeff[i] = NAN;
+}
+
+SwsVector *sws_allocVec(int length)
+{
+    SwsVector *vec;
+
+    if(length <= 0 || length > INT_MAX/ sizeof(double))
+        return NULL;
+
+    vec = av_malloc(sizeof(SwsVector));
+    if (!vec)
+        return NULL;
+    vec->length = length;
+    vec->coeff  = av_malloc(sizeof(double) * length);
+    if (!vec->coeff)
+        av_freep(&vec);
+    return vec;
+}
+
+SwsVector *sws_getGaussianVec(double variance, double quality)
+{
+    const int length = (int)(variance * quality + 0.5) | 1;
+    int i;
+    double middle  = (length - 1) * 0.5;
+    SwsVector *vec;
+
+    if(variance < 0 || quality < 0)
+        return NULL;
+
+    vec = sws_allocVec(length);
+
+    if (!vec)
+        return NULL;
+
+    for (i = 0; i < length; i++) {
+        double dist = i - middle;
+        vec->coeff[i] = exp(-dist * dist / (2 * variance * variance)) /
+                        sqrt(2 * variance * M_PI);
+    }
+
+    sws_normalizeVec(vec, 1.0);
+
+    return vec;
+}
+
+/**
+ * Allocate and return a vector with length coefficients, all
+ * with the same value c.
+ */
+static
+SwsVector *sws_getConstVec(double c, int length)
+{
+    int i;
+    SwsVector *vec = sws_allocVec(length);
+
+    if (!vec)
+        return NULL;
+
+    for (i = 0; i < length; i++)
+        vec->coeff[i] = c;
+
+    return vec;
+}
+
+/**
+ * Allocate and return a vector with just one coefficient, with
+ * value 1.0.
+ */
+static
+SwsVector *sws_getIdentityVec(void)
+{
+    return sws_getConstVec(1.0, 1);
+}
+
+static double sws_dcVec(SwsVector *a)
+{
+    int i;
+    double sum = 0;
+
+    for (i = 0; i < a->length; i++)
+        sum += a->coeff[i];
+
+    return sum;
+}
+
+void sws_scaleVec(SwsVector *a, double scalar)
+{
+    int i;
+
+    for (i = 0; i < a->length; i++)
+        a->coeff[i] *= scalar;
+}
+
+void sws_normalizeVec(SwsVector *a, double height)
+{
+    sws_scaleVec(a, height / sws_dcVec(a));
+}
+
+static SwsVector *sws_sumVec(SwsVector *a, SwsVector *b)
+{
+    int length = FFMAX(a->length, b->length);
+    int i;
+    SwsVector *vec = sws_getConstVec(0.0, length);
+
+    if (!vec)
+        return NULL;
+
+    for (i = 0; i < a->length; i++)
+        vec->coeff[i + (length - 1) / 2 - (a->length - 1) / 2] += a->coeff[i];
+    for (i = 0; i < b->length; i++)
+        vec->coeff[i + (length - 1) / 2 - (b->length - 1) / 2] += b->coeff[i];
+
+    return vec;
+}
+
+/* shift left / or right if "shift" is negative */
+static SwsVector *sws_getShiftedVec(SwsVector *a, int shift)
+{
+    int length = a->length + FFABS(shift) * 2;
+    int i;
+    SwsVector *vec = sws_getConstVec(0.0, length);
+
+    if (!vec)
+        return NULL;
+
+    for (i = 0; i < a->length; i++) {
+        vec->coeff[i + (length    - 1) / 2 -
+                       (a->length - 1) / 2 - shift] = a->coeff[i];
+    }
+
+    return vec;
+}
+
+static
+void sws_shiftVec(SwsVector *a, int shift)
+{
+    SwsVector *shifted = sws_getShiftedVec(a, shift);
+    if (!shifted) {
+        makenan_vec(a);
+        return;
+    }
+    av_free(a->coeff);
+    a->coeff  = shifted->coeff;
+    a->length = shifted->length;
+    av_free(shifted);
+}
+
+static
+void sws_addVec(SwsVector *a, SwsVector *b)
+{
+    SwsVector *sum = sws_sumVec(a, b);
+    if (!sum) {
+        makenan_vec(a);
+        return;
+    }
+    av_free(a->coeff);
+    a->coeff  = sum->coeff;
+    a->length = sum->length;
+    av_free(sum);
+}
+
+/**
+ * Print with av_log() a textual representation of the vector a
+ * if log_level <= av_log_level.
+ */
+static
+void sws_printVec2(SwsVector *a, AVClass *log_ctx, int log_level)
+{
+    int i;
+    double max = 0;
+    double min = 0;
+    double range;
+
+    for (i = 0; i < a->length; i++)
+        if (a->coeff[i] > max)
+            max = a->coeff[i];
+
+    for (i = 0; i < a->length; i++)
+        if (a->coeff[i] < min)
+            min = a->coeff[i];
+
+    range = max - min;
+
+    for (i = 0; i < a->length; i++) {
+        int x = (int)((a->coeff[i] - min) * 60.0 / range + 0.5);
+        av_log(log_ctx, log_level, "%1.3f ", a->coeff[i]);
+        for (; x > 0; x--)
+            av_log(log_ctx, log_level, " ");
+        av_log(log_ctx, log_level, "|\n");
+    }
+}
+
+void sws_freeVec(SwsVector *a)
+{
+    if (!a)
+        return;
+    av_freep(&a->coeff);
+    a->length = 0;
+    av_free(a);
+}
+
+void sws_freeFilter(SwsFilter *filter)
+{
+    if (!filter)
+        return;
+
+    sws_freeVec(filter->lumH);
+    sws_freeVec(filter->lumV);
+    sws_freeVec(filter->chrH);
+    sws_freeVec(filter->chrV);
+    av_free(filter);
 }
 
 SwsFilter *sws_getDefaultFilter(float lumaGBlur, float chromaGBlur,
@@ -2008,314 +2480,30 @@ fail:
     return NULL;
 }
 
-SwsVector *sws_allocVec(int length)
+void sws_freeContext(SwsContext *sws)
 {
-    SwsVector *vec;
-
-    if(length <= 0 || length > INT_MAX/ sizeof(double))
-        return NULL;
-
-    vec = av_malloc(sizeof(SwsVector));
-    if (!vec)
-        return NULL;
-    vec->length = length;
-    vec->coeff  = av_malloc(sizeof(double) * length);
-    if (!vec->coeff)
-        av_freep(&vec);
-    return vec;
-}
-
-SwsVector *sws_getGaussianVec(double variance, double quality)
-{
-    const int length = (int)(variance * quality + 0.5) | 1;
-    int i;
-    double middle  = (length - 1) * 0.5;
-    SwsVector *vec;
-
-    if(variance < 0 || quality < 0)
-        return NULL;
-
-    vec = sws_allocVec(length);
-
-    if (!vec)
-        return NULL;
-
-    for (i = 0; i < length; i++) {
-        double dist = i - middle;
-        vec->coeff[i] = exp(-dist * dist / (2 * variance * variance)) /
-                        sqrt(2 * variance * M_PI);
-    }
-
-    sws_normalizeVec(vec, 1.0);
-
-    return vec;
-}
-
-/**
- * Allocate and return a vector with length coefficients, all
- * with the same value c.
- */
-#if !FF_API_SWS_VECTOR
-static
-#endif
-SwsVector *sws_getConstVec(double c, int length)
-{
-    int i;
-    SwsVector *vec = sws_allocVec(length);
-
-    if (!vec)
-        return NULL;
-
-    for (i = 0; i < length; i++)
-        vec->coeff[i] = c;
-
-    return vec;
-}
-
-/**
- * Allocate and return a vector with just one coefficient, with
- * value 1.0.
- */
-#if !FF_API_SWS_VECTOR
-static
-#endif
-SwsVector *sws_getIdentityVec(void)
-{
-    return sws_getConstVec(1.0, 1);
-}
-
-static double sws_dcVec(SwsVector *a)
-{
-    int i;
-    double sum = 0;
-
-    for (i = 0; i < a->length; i++)
-        sum += a->coeff[i];
-
-    return sum;
-}
-
-void sws_scaleVec(SwsVector *a, double scalar)
-{
-    int i;
-
-    for (i = 0; i < a->length; i++)
-        a->coeff[i] *= scalar;
-}
-
-void sws_normalizeVec(SwsVector *a, double height)
-{
-    sws_scaleVec(a, height / sws_dcVec(a));
-}
-
-#if FF_API_SWS_VECTOR
-static SwsVector *sws_getConvVec(SwsVector *a, SwsVector *b)
-{
-    int length = a->length + b->length - 1;
-    int i, j;
-    SwsVector *vec = sws_getConstVec(0.0, length);
-
-    if (!vec)
-        return NULL;
-
-    for (i = 0; i < a->length; i++) {
-        for (j = 0; j < b->length; j++) {
-            vec->coeff[i + j] += a->coeff[i] * b->coeff[j];
-        }
-    }
-
-    return vec;
-}
-#endif
-
-static SwsVector *sws_sumVec(SwsVector *a, SwsVector *b)
-{
-    int length = FFMAX(a->length, b->length);
-    int i;
-    SwsVector *vec = sws_getConstVec(0.0, length);
-
-    if (!vec)
-        return NULL;
-
-    for (i = 0; i < a->length; i++)
-        vec->coeff[i + (length - 1) / 2 - (a->length - 1) / 2] += a->coeff[i];
-    for (i = 0; i < b->length; i++)
-        vec->coeff[i + (length - 1) / 2 - (b->length - 1) / 2] += b->coeff[i];
-
-    return vec;
-}
-
-#if FF_API_SWS_VECTOR
-static SwsVector *sws_diffVec(SwsVector *a, SwsVector *b)
-{
-    int length = FFMAX(a->length, b->length);
-    int i;
-    SwsVector *vec = sws_getConstVec(0.0, length);
-
-    if (!vec)
-        return NULL;
-
-    for (i = 0; i < a->length; i++)
-        vec->coeff[i + (length - 1) / 2 - (a->length - 1) / 2] += a->coeff[i];
-    for (i = 0; i < b->length; i++)
-        vec->coeff[i + (length - 1) / 2 - (b->length - 1) / 2] -= b->coeff[i];
-
-    return vec;
-}
-#endif
-
-/* shift left / or right if "shift" is negative */
-static SwsVector *sws_getShiftedVec(SwsVector *a, int shift)
-{
-    int length = a->length + FFABS(shift) * 2;
-    int i;
-    SwsVector *vec = sws_getConstVec(0.0, length);
-
-    if (!vec)
-        return NULL;
-
-    for (i = 0; i < a->length; i++) {
-        vec->coeff[i + (length    - 1) / 2 -
-                       (a->length - 1) / 2 - shift] = a->coeff[i];
-    }
-
-    return vec;
-}
-
-#if !FF_API_SWS_VECTOR
-static
-#endif
-void sws_shiftVec(SwsVector *a, int shift)
-{
-    SwsVector *shifted = sws_getShiftedVec(a, shift);
-    if (!shifted) {
-        makenan_vec(a);
-        return;
-    }
-    av_free(a->coeff);
-    a->coeff  = shifted->coeff;
-    a->length = shifted->length;
-    av_free(shifted);
-}
-
-#if !FF_API_SWS_VECTOR
-static
-#endif
-void sws_addVec(SwsVector *a, SwsVector *b)
-{
-    SwsVector *sum = sws_sumVec(a, b);
-    if (!sum) {
-        makenan_vec(a);
-        return;
-    }
-    av_free(a->coeff);
-    a->coeff  = sum->coeff;
-    a->length = sum->length;
-    av_free(sum);
-}
-
-#if FF_API_SWS_VECTOR
-void sws_subVec(SwsVector *a, SwsVector *b)
-{
-    SwsVector *diff = sws_diffVec(a, b);
-    if (!diff) {
-        makenan_vec(a);
-        return;
-    }
-    av_free(a->coeff);
-    a->coeff  = diff->coeff;
-    a->length = diff->length;
-    av_free(diff);
-}
-
-void sws_convVec(SwsVector *a, SwsVector *b)
-{
-    SwsVector *conv = sws_getConvVec(a, b);
-    if (!conv) {
-        makenan_vec(a);
-        return;
-    }
-    av_free(a->coeff);
-    a->coeff  = conv->coeff;
-    a->length = conv->length;
-    av_free(conv);
-}
-
-SwsVector *sws_cloneVec(SwsVector *a)
-{
-    SwsVector *vec = sws_allocVec(a->length);
-
-    if (!vec)
-        return NULL;
-
-    memcpy(vec->coeff, a->coeff, a->length * sizeof(*a->coeff));
-
-    return vec;
-}
-#endif
-
-/**
- * Print with av_log() a textual representation of the vector a
- * if log_level <= av_log_level.
- */
-#if !FF_API_SWS_VECTOR
-static
-#endif
-void sws_printVec2(SwsVector *a, AVClass *log_ctx, int log_level)
-{
-    int i;
-    double max = 0;
-    double min = 0;
-    double range;
-
-    for (i = 0; i < a->length; i++)
-        if (a->coeff[i] > max)
-            max = a->coeff[i];
-
-    for (i = 0; i < a->length; i++)
-        if (a->coeff[i] < min)
-            min = a->coeff[i];
-
-    range = max - min;
-
-    for (i = 0; i < a->length; i++) {
-        int x = (int)((a->coeff[i] - min) * 60.0 / range + 0.5);
-        av_log(log_ctx, log_level, "%1.3f ", a->coeff[i]);
-        for (; x > 0; x--)
-            av_log(log_ctx, log_level, " ");
-        av_log(log_ctx, log_level, "|\n");
-    }
-}
-
-void sws_freeVec(SwsVector *a)
-{
-    if (!a)
-        return;
-    av_freep(&a->coeff);
-    a->length = 0;
-    av_free(a);
-}
-
-void sws_freeFilter(SwsFilter *filter)
-{
-    if (!filter)
-        return;
-
-    sws_freeVec(filter->lumH);
-    sws_freeVec(filter->lumV);
-    sws_freeVec(filter->chrH);
-    sws_freeVec(filter->chrV);
-    av_free(filter);
-}
-
-void sws_freeContext(SwsContext *c)
-{
+    SwsInternal *c = sws_internal(sws);
     int i;
     if (!c)
         return;
 
+    for (i = 0; i < FF_ARRAY_ELEMS(c->graph); i++)
+        ff_sws_graph_free(&c->graph[i]);
+
+    for (i = 0; i < c->nb_slice_ctx; i++)
+        sws_freeContext(c->slice_ctx[i]);
+    av_freep(&c->slice_ctx);
+    av_freep(&c->slice_err);
+
+    avpriv_slicethread_free(&c->slicethread);
+
     for (i = 0; i < 4; i++)
         av_freep(&c->dither_error[i]);
+
+    av_frame_free(&c->frame_src);
+    av_frame_free(&c->frame_dst);
+
+    av_freep(&c->src_ranges.ranges);
 
     av_freep(&c->vLumFilter);
     av_freep(&c->vChrFilter);
@@ -2357,74 +2545,447 @@ void sws_freeContext(SwsContext *c)
     sws_freeContext(c->cascaded_context[1]);
     sws_freeContext(c->cascaded_context[2]);
     memset(c->cascaded_context, 0, sizeof(c->cascaded_context));
-    av_freep(&c->cascaded_tmp[0]);
-    av_freep(&c->cascaded1_tmp[0]);
+    av_freep(&c->cascaded_tmp[0][0]);
+    av_freep(&c->cascaded_tmp[1][0]);
 
     av_freep(&c->gamma);
     av_freep(&c->inv_gamma);
+#if CONFIG_SMALL
+    av_freep(&c->xyzgamma);
+#endif
+
+    av_freep(&c->rgb0_scratch);
+    av_freep(&c->xyz_scratch);
 
     ff_free_filters(c);
 
     av_free(c);
 }
 
-struct SwsContext *sws_getCachedContext(struct SwsContext *context, int srcW,
-                                        int srcH, enum AVPixelFormat srcFormat,
-                                        int dstW, int dstH,
-                                        enum AVPixelFormat dstFormat, int flags,
-                                        SwsFilter *srcFilter,
-                                        SwsFilter *dstFilter,
-                                        const double *param)
+void sws_free_context(SwsContext **pctx)
 {
+    SwsContext *ctx = *pctx;
+    if (!ctx)
+        return;
+
+    sws_freeContext(ctx);
+    *pctx = NULL;
+}
+
+SwsContext *sws_getCachedContext(SwsContext *prev, int srcW,
+                                 int srcH, enum AVPixelFormat srcFormat,
+                                 int dstW, int dstH,
+                                 enum AVPixelFormat dstFormat, int flags,
+                                 SwsFilter *srcFilter,
+                                 SwsFilter *dstFilter,
+                                 const double *param)
+{
+    SwsContext *sws;
     static const double default_param[2] = { SWS_PARAM_DEFAULT,
                                              SWS_PARAM_DEFAULT };
-    int64_t src_h_chr_pos = -513, dst_h_chr_pos = -513,
-            src_v_chr_pos = -513, dst_v_chr_pos = -513;
 
     if (!param)
         param = default_param;
 
-    if (context &&
-        (context->srcW      != srcW      ||
-         context->srcH      != srcH      ||
-         context->srcFormat != srcFormat ||
-         context->dstW      != dstW      ||
-         context->dstH      != dstH      ||
-         context->dstFormat != dstFormat ||
-         context->flags     != flags     ||
-         context->param[0]  != param[0]  ||
-         context->param[1]  != param[1])) {
-
-        av_opt_get_int(context, "src_h_chr_pos", 0, &src_h_chr_pos);
-        av_opt_get_int(context, "src_v_chr_pos", 0, &src_v_chr_pos);
-        av_opt_get_int(context, "dst_h_chr_pos", 0, &dst_h_chr_pos);
-        av_opt_get_int(context, "dst_v_chr_pos", 0, &dst_v_chr_pos);
-        sws_freeContext(context);
-        context = NULL;
+    if (prev && (prev->src_w            == srcW      &&
+                 prev->src_h            == srcH      &&
+                 prev->src_format       == srcFormat &&
+                 prev->dst_w            == dstW      &&
+                 prev->dst_h            == dstH      &&
+                 prev->dst_format       == dstFormat &&
+                 prev->flags            == flags     &&
+                 prev->scaler_params[0] == param[0]  &&
+                 prev->scaler_params[1] == param[1])) {
+        return prev;
     }
 
-    if (!context) {
-        if (!(context = sws_alloc_context()))
-            return NULL;
-        context->srcW      = srcW;
-        context->srcH      = srcH;
-        context->srcFormat = srcFormat;
-        context->dstW      = dstW;
-        context->dstH      = dstH;
-        context->dstFormat = dstFormat;
-        context->flags     = flags;
-        context->param[0]  = param[0];
-        context->param[1]  = param[1];
+    if (!(sws = sws_alloc_context())) {
+        sws_free_context(&prev);
+        return NULL;
+    }
 
-        av_opt_set_int(context, "src_h_chr_pos", src_h_chr_pos, 0);
-        av_opt_set_int(context, "src_v_chr_pos", src_v_chr_pos, 0);
-        av_opt_set_int(context, "dst_h_chr_pos", dst_h_chr_pos, 0);
-        av_opt_set_int(context, "dst_v_chr_pos", dst_v_chr_pos, 0);
+    if (prev) {
+        av_opt_copy(sws, prev);
+        sws_free_context(&prev);
+    }
 
-        if (sws_init_context(context, srcFilter, dstFilter) < 0) {
-            sws_freeContext(context);
-            return NULL;
+    sws->src_w            = srcW;
+    sws->src_h            = srcH;
+    sws->src_format       = srcFormat;
+    sws->dst_w            = dstW;
+    sws->dst_h            = dstH;
+    sws->dst_format       = dstFormat;
+    sws->flags            = flags;
+    sws->scaler_params[0] = param[0];
+    sws->scaler_params[1] = param[1];
+
+    if (sws_init_context(sws, srcFilter, dstFilter) < 0)
+        sws_free_context(&sws);
+
+    return sws;
+}
+
+int ff_range_add(RangeList *rl, unsigned int start, unsigned int len)
+{
+    Range *tmp;
+    unsigned int idx;
+
+    /* find the first existing range after the new one */
+    for (idx = 0; idx < rl->nb_ranges; idx++)
+        if (rl->ranges[idx].start > start)
+            break;
+
+    /* check for overlap */
+    if (idx > 0) {
+        Range *prev = &rl->ranges[idx - 1];
+        if (prev->start + prev->len > start)
+            return AVERROR(EINVAL);
+    }
+    if (idx < rl->nb_ranges) {
+        Range *next = &rl->ranges[idx];
+        if (start + len > next->start)
+            return AVERROR(EINVAL);
+    }
+
+    tmp = av_fast_realloc(rl->ranges, &rl->ranges_allocated,
+                          (rl->nb_ranges + 1) * sizeof(*rl->ranges));
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    rl->ranges = tmp;
+
+    memmove(rl->ranges + idx + 1, rl->ranges + idx,
+            sizeof(*rl->ranges) * (rl->nb_ranges - idx));
+    rl->ranges[idx].start = start;
+    rl->ranges[idx].len   = len;
+    rl->nb_ranges++;
+
+    /* merge ranges */
+    if (idx > 0) {
+        Range *prev = &rl->ranges[idx - 1];
+        Range *cur  = &rl->ranges[idx];
+        if (prev->start + prev->len == cur->start) {
+            prev->len += cur->len;
+            memmove(rl->ranges + idx - 1, rl->ranges + idx,
+                    sizeof(*rl->ranges) * (rl->nb_ranges - idx));
+            rl->nb_ranges--;
+            idx--;
         }
     }
-    return context;
+    if (idx < rl->nb_ranges - 1) {
+        Range *cur  = &rl->ranges[idx];
+        Range *next = &rl->ranges[idx + 1];
+        if (cur->start + cur->len == next->start) {
+            cur->len += next->len;
+            memmove(rl->ranges + idx, rl->ranges + idx + 1,
+                    sizeof(*rl->ranges) * (rl->nb_ranges - idx - 1));
+            rl->nb_ranges--;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * This function also sanitizes and strips the input data, removing irrelevant
+ * fields for certain formats.
+ */
+SwsFormat ff_fmt_from_frame(const AVFrame *frame, int field)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
+    const AVColorPrimariesDesc *primaries;
+    AVFrameSideData *sd;
+
+    SwsFormat fmt = {
+        .width  = frame->width,
+        .height = frame->height,
+        .format = frame->format,
+        .range  = frame->color_range,
+        .csp    = frame->colorspace,
+        .loc    = frame->chroma_location,
+        .desc   = desc,
+        .color = {
+            .prim = frame->color_primaries,
+            .trc  = frame->color_trc,
+        },
+    };
+
+    av_assert1(fmt.width > 0);
+    av_assert1(fmt.height > 0);
+    av_assert1(fmt.format != AV_PIX_FMT_NONE);
+    av_assert0(desc);
+    if (desc->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BAYER)) {
+        /* RGB-like family */
+        fmt.csp   = AVCOL_SPC_RGB;
+        fmt.range = AVCOL_RANGE_JPEG;
+    } else if (desc->flags & AV_PIX_FMT_FLAG_XYZ) {
+        fmt.csp   = AVCOL_SPC_UNSPECIFIED;
+        fmt.color = (SwsColor) {
+            .prim = AVCOL_PRI_BT709, /* swscale currently hard-codes this XYZ matrix */
+            .trc  = AVCOL_TRC_SMPTE428,
+        };
+    } else if (desc->nb_components < 3) {
+        /* Grayscale formats */
+        fmt.color.prim = AVCOL_PRI_UNSPECIFIED;
+        fmt.csp        = AVCOL_SPC_UNSPECIFIED;
+        if (desc->flags & AV_PIX_FMT_FLAG_FLOAT)
+            fmt.range = AVCOL_RANGE_UNSPECIFIED;
+        else
+            fmt.range = AVCOL_RANGE_JPEG; // FIXME: this restriction should be lifted
+    }
+
+    switch (frame->format) {
+    case AV_PIX_FMT_YUVJ420P:
+    case AV_PIX_FMT_YUVJ411P:
+    case AV_PIX_FMT_YUVJ422P:
+    case AV_PIX_FMT_YUVJ444P:
+    case AV_PIX_FMT_YUVJ440P:
+        fmt.range = AVCOL_RANGE_JPEG;
+        break;
+    }
+
+    if (!desc->log2_chroma_w && !desc->log2_chroma_h)
+        fmt.loc = AVCHROMA_LOC_UNSPECIFIED;
+
+    if (frame->flags & AV_FRAME_FLAG_INTERLACED) {
+        fmt.height = (fmt.height + (field == FIELD_TOP)) >> 1;
+        fmt.interlaced = 1;
+    }
+
+    /* Set luminance and gamut information */
+    fmt.color.min_luma = av_make_q(0, 1);
+    switch (fmt.color.trc) {
+    case AVCOL_TRC_SMPTE2084:
+        fmt.color.max_luma = av_make_q(10000, 1); break;
+    case AVCOL_TRC_ARIB_STD_B67:
+        fmt.color.max_luma = av_make_q( 1000, 1); break; /* HLG reference display */
+    default:
+        fmt.color.max_luma = av_make_q(  203, 1); break; /* SDR reference brightness */
+    }
+
+    primaries = av_csp_primaries_desc_from_id(fmt.color.prim);
+    if (primaries)
+        fmt.color.gamut = primaries->prim;
+
+    if ((sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA))) {
+        const AVMasteringDisplayMetadata *mdm = (const AVMasteringDisplayMetadata *) sd->data;
+        if (mdm->has_luminance) {
+            fmt.color.min_luma = mdm->min_luminance;
+            fmt.color.max_luma = mdm->max_luminance;
+        }
+
+        if (mdm->has_primaries) {
+            /* Ignore mastering display white point as it has no bearance on
+             * the underlying content */
+            fmt.color.gamut.r.x = mdm->display_primaries[0][0];
+            fmt.color.gamut.r.y = mdm->display_primaries[0][1];
+            fmt.color.gamut.g.x = mdm->display_primaries[1][0];
+            fmt.color.gamut.g.y = mdm->display_primaries[1][1];
+            fmt.color.gamut.b.x = mdm->display_primaries[2][0];
+            fmt.color.gamut.b.y = mdm->display_primaries[2][1];
+        }
+    }
+
+    if ((sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS))) {
+        const AVDynamicHDRPlus *dhp = (const AVDynamicHDRPlus *) sd->data;
+        const AVHDRPlusColorTransformParams *pars = &dhp->params[0];
+        const AVRational nits = av_make_q(10000, 1);
+        AVRational maxrgb = pars->maxscl[0];
+
+        if (!dhp->num_windows || dhp->application_version > 1)
+            goto skip_hdr10;
+
+        /* Maximum of MaxSCL components */
+        if (av_cmp_q(pars->maxscl[1], maxrgb) > 0)
+            maxrgb = pars->maxscl[1];
+        if (av_cmp_q(pars->maxscl[2], maxrgb) > 0)
+            maxrgb = pars->maxscl[2];
+
+        if (maxrgb.num > 0) {
+            /* Estimate true luminance from MaxSCL */
+            const AVLumaCoefficients *luma = av_csp_luma_coeffs_from_avcsp(fmt.csp);
+            if (!luma)
+                goto skip_hdr10;
+            fmt.color.frame_peak = av_add_q(av_mul_q(luma->cr, pars->maxscl[0]),
+                                   av_add_q(av_mul_q(luma->cg, pars->maxscl[1]),
+                                            av_mul_q(luma->cb, pars->maxscl[2])));
+            /* Scale the scene average brightness by the ratio between the
+             * maximum luminance and the MaxRGB values */
+            fmt.color.frame_avg = av_mul_q(pars->average_maxrgb,
+                                           av_div_q(fmt.color.frame_peak, maxrgb));
+        } else {
+            /**
+             * Calculate largest value from histogram to use as fallback for
+             * clips with missing MaxSCL information. Note that this may end
+             * up picking the "reserved" value at the 5% percentile, which in
+             * practice appears to track the brightest pixel in the scene.
+             */
+            for (int i = 0; i < pars->num_distribution_maxrgb_percentiles; i++) {
+                const AVRational pct = pars->distribution_maxrgb[i].percentile;
+                if (av_cmp_q(pct, maxrgb) > 0)
+                    maxrgb = pct;
+                fmt.color.frame_peak = maxrgb;
+                fmt.color.frame_avg  = pars->average_maxrgb;
+            }
+        }
+
+        /* Rescale to nits */
+        fmt.color.frame_peak = av_mul_q(nits, fmt.color.frame_peak);
+        fmt.color.frame_avg  = av_mul_q(nits, fmt.color.frame_avg);
+    }
+skip_hdr10:
+
+    /* PQ is always scaled down to absolute zero, so ignore mastering metadata */
+    if (fmt.color.trc == AVCOL_TRC_SMPTE2084)
+        fmt.color.min_luma = av_make_q(0, 1);
+
+    return fmt;
+}
+
+static int infer_prim_ref(SwsColor *csp, const SwsColor *ref)
+{
+    if (csp->prim != AVCOL_PRI_UNSPECIFIED)
+        return 0;
+
+    /* Re-use the reference gamut only for "safe", similar primaries */
+    switch (ref->prim) {
+    case AVCOL_PRI_BT709:
+    case AVCOL_PRI_BT470M:
+    case AVCOL_PRI_BT470BG:
+    case AVCOL_PRI_SMPTE170M:
+    case AVCOL_PRI_SMPTE240M:
+        csp->prim  = ref->prim;
+        csp->gamut = ref->gamut;
+        break;
+    default:
+        csp->prim  = AVCOL_PRI_BT709;
+        csp->gamut = av_csp_primaries_desc_from_id(csp->prim)->prim;
+        break;
+    }
+
+    return 1;
+}
+
+static int infer_trc_ref(SwsColor *csp, const SwsColor *ref)
+{
+    if (csp->trc != AVCOL_TRC_UNSPECIFIED)
+        return 0;
+
+    /* Pick a suitable SDR transfer function, to try and minimize conversions */
+    switch (ref->trc) {
+    case AVCOL_TRC_UNSPECIFIED:
+    /* HDR curves, never default to these */
+    case AVCOL_TRC_SMPTE2084:
+    case AVCOL_TRC_ARIB_STD_B67:
+        csp->trc = AVCOL_TRC_BT709;
+        csp->min_luma = av_make_q(0, 1);
+        csp->max_luma = av_make_q(203, 1);
+        break;
+    default:
+        csp->trc = ref->trc;
+        csp->min_luma = ref->min_luma;
+        csp->max_luma = ref->max_luma;
+        break;
+    }
+
+    return 1;
+}
+
+int ff_infer_colors(SwsColor *src, SwsColor *dst)
+{
+    int incomplete = 0;
+
+    incomplete |= infer_prim_ref(dst, src);
+    incomplete |= infer_prim_ref(src, dst);
+    av_assert0(src->prim != AVCOL_PRI_UNSPECIFIED);
+    av_assert0(dst->prim != AVCOL_PRI_UNSPECIFIED);
+
+    incomplete |= infer_trc_ref(dst, src);
+    incomplete |= infer_trc_ref(src, dst);
+    av_assert0(src->trc != AVCOL_TRC_UNSPECIFIED);
+    av_assert0(dst->trc != AVCOL_TRC_UNSPECIFIED);
+
+    return incomplete;
+}
+
+int sws_test_format(enum AVPixelFormat format, int output)
+{
+    return output ? sws_isSupportedOutput(format) : sws_isSupportedInput(format);
+}
+
+int sws_test_colorspace(enum AVColorSpace csp, int output)
+{
+    switch (csp) {
+    case AVCOL_SPC_UNSPECIFIED:
+    case AVCOL_SPC_RGB:
+    case AVCOL_SPC_BT709:
+    case AVCOL_SPC_BT470BG:
+    case AVCOL_SPC_SMPTE170M:
+    case AVCOL_SPC_FCC:
+    case AVCOL_SPC_SMPTE240M:
+    case AVCOL_SPC_BT2020_NCL:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+int sws_test_primaries(enum AVColorPrimaries prim, int output)
+{
+    return prim > AVCOL_PRI_RESERVED0 && prim < AVCOL_PRI_NB &&
+           prim != AVCOL_PRI_RESERVED;
+}
+
+int sws_test_transfer(enum AVColorTransferCharacteristic trc, int output)
+{
+    av_csp_eotf_function eotf = output ? av_csp_itu_eotf_inv(trc)
+                                       : av_csp_itu_eotf(trc);
+    return trc == AVCOL_TRC_UNSPECIFIED || eotf != NULL;
+}
+
+static int test_range(enum AVColorRange range)
+{
+    return range >= 0 && range < AVCOL_RANGE_NB;
+}
+
+static int test_loc(enum AVChromaLocation loc)
+{
+    return loc >= 0 && loc < AVCHROMA_LOC_NB;
+}
+
+int ff_test_fmt(const SwsFormat *fmt, int output)
+{
+    return fmt->width > 0 && fmt->height > 0            &&
+           sws_test_format    (fmt->format,     output) &&
+           sws_test_colorspace(fmt->csp,        output) &&
+           sws_test_primaries (fmt->color.prim, output) &&
+           sws_test_transfer  (fmt->color.trc,  output) &&
+           test_range         (fmt->range)              &&
+           test_loc           (fmt->loc);
+}
+
+int sws_test_frame(const AVFrame *frame, int output)
+{
+    for (int field = 0; field < 2; field++) {
+        const SwsFormat fmt = ff_fmt_from_frame(frame, field);
+        if (!ff_test_fmt(&fmt, output))
+            return 0;
+        if (!fmt.interlaced)
+            break;
+    }
+
+    return 1;
+}
+
+int sws_is_noop(const AVFrame *dst, const AVFrame *src)
+{
+    for (int field = 0; field < 2; field++) {
+        SwsFormat dst_fmt = ff_fmt_from_frame(dst, field);
+        SwsFormat src_fmt = ff_fmt_from_frame(src, field);
+        if (!ff_fmt_equal(&dst_fmt, &src_fmt))
+            return 0;
+        if (!dst_fmt.interlaced)
+            break;
+    }
+
+    return 1;
 }
